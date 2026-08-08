@@ -7,15 +7,15 @@ bits 64
 %macro ISR_NOERR 1
 global isr%1
 isr%1:
-    push 0          ; dummy error code
-    push %1         ; ISR number
+    push 0
+    push %1
     jmp isr_common
 %endmacro
 
 %macro ISR_ERR 1
 global isr%1
 isr%1:
-    push %1         ; ISR number (error code ya esta en stack)
+    push %1
     jmp isr_common
 %endmacro
 
@@ -27,7 +27,6 @@ irq%1:
     jmp irq_common
 %endmacro
 
-; Excepciones CPU (0-31)
 ISR_NOERR 0
 ISR_NOERR 1
 ISR_NOERR 2
@@ -45,7 +44,7 @@ ISR_ERR   13
 ISR_ERR   14
 ISR_NOERR 15
 ISR_NOERR 16
-ISR_ERR   17
+ISR_NOERR 17
 ISR_NOERR 18
 ISR_NOERR 19
 ISR_NOERR 20
@@ -61,7 +60,6 @@ ISR_NOERR 29
 ISR_ERR   30
 ISR_NOERR 31
 
-; IRQs (0-15 -> IDT 32-47)
 IRQ 0, 32
 IRQ 1, 33
 IRQ 2, 34
@@ -83,7 +81,6 @@ extern isr_handler
 extern irq_handler
 
 isr_common:
-    ; Guardar todos los registros
     push rax
     push rcx
     push rdx
@@ -100,8 +97,9 @@ isr_common:
     push r14
     push r15
 
-    mov rdi, [rsp + 120]   ; ISR number
-    mov rsi, [rsp + 128]   ; Error code
+    mov rdi, [rsp + 120]
+    mov rsi, [rsp + 128]
+    mov rdx, [rsp + 136]   ; CPU-pushed RIP
     call isr_handler
 
     pop r15
@@ -119,7 +117,7 @@ isr_common:
     pop rdx
     pop rcx
     pop rax
-    add rsp, 16            ; Limpiar error code + ISR number
+    add rsp, 16
     iretq
 
 irq_common:
@@ -139,8 +137,8 @@ irq_common:
     push r14
     push r15
 
-    mov rdi, [rsp + 120]   ; IRQ number (IDT index)
-    sub rdi, 32            ; Convertir a 0-15
+    mov rdi, [rsp + 120]
+    sub rdi, 32
     call irq_handler
 
     pop r15
