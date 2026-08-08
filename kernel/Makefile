@@ -1,5 +1,3 @@
-
-
 # kernel/Makefile
 # Detecta automaticamente el toolchain disponible
 
@@ -9,7 +7,7 @@ AS      = nasm
 CROSS := $(shell which x86_64-elf-gcc 2>/dev/null)
 ifeq ($(CROSS),)
     CC = gcc
-    # Flags para compilar kernel con gcc nativo (Añadido -fno-pic -fno-pie)
+    # Flags para compilar kernel con gcc nativo
     CFLAGS = -ffreestanding -O2 -Wall -Wextra -fno-pic -fno-pie -fno-exceptions -mno-red-zone \
              -mcmodel=kernel -fno-stack-protector -fno-asynchronous-unwind-tables \
              -nostdlib -nostartfiles -nodefaultlibs -I.
@@ -29,15 +27,15 @@ TARGET  = kernel.elf
 all: $(TARGET)
 
 $(TARGET): $(OBJS) linker.ld
-        $(LD) $(LDFLAGS) -o $@ $(OBJS)
+	$(LD) $(LDFLAGS) -o $@ $(OBJS)
 
 %.o: %.c
-        $(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -c $< -o $@
 
 %.o: %.asm
-        $(AS) -f elf64 $< -o $@
+	$(AS) -f elf64 $< -o $@
 
 clean:
-        rm -f $(OBJS) $(TARGET)
+	rm -f $(OBJS) $(TARGET)
 
 .PHONY: all clean
