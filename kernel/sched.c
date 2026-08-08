@@ -53,6 +53,13 @@ task_t *sched_create_task(void (*fn)(void)) {
     return NULL;
   }
 
+  /*
+   * IMPORTANT: stack is a byte pointer.  Adding TASK_STACK_SIZE to a
+   * uint64_t* would advance by TASK_STACK_SIZE * 8 bytes, placing the
+   * synthetic context 56 KiB past the 8 KiB allocation.  That corrupted
+   * unrelated heap memory and eventually made RET fault during the first
+   * context switch.
+   */
   uint64_t *sp = (uint64_t *)(((uint64_t)(stack + TASK_STACK_SIZE)) & ~0xFULL);
 
   *(--sp) = (uint64_t)task_trampoline;
