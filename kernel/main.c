@@ -253,13 +253,12 @@ void kmain(struct kernel_boot_info *kinfo) {
     if (win_info) {
       win_set_icon_text(win_info, "i", WIN11_ACCENT);
       win_clear(win_info, 0xFF181818);
-      win_draw_string(win_info, 16, 16, "AURORA OS", WIN11_ACCENT, FONT_ID_SANS);
-      win_draw_string(win_info, 16, 42, "Kernel: x86_64", 0xFFFFFFFF, FONT_ID_SANS);
-      win_draw_string(win_info, 16, 64, "Memory: PMM + VMM", 0xFFFFFFFF, FONT_ID_SANS);
-      win_draw_string(win_info, 16, 86, "Scheduler: active", 0xFFFFFFFF, FONT_ID_SANS);
+      win_draw_string(win_info, 16, 16, "AURORA OS", WIN11_ACCENT, FONT_ID_MAIN_REGULAR);
+      win_draw_string(win_info, 16, 42, "Kernel: x86_64", 0xFFFFFFFF, FONT_ID_MAIN_REGULAR);
+      win_draw_string(win_info, 16, 64, "Memory: PMM + VMM", 0xFFFFFFFF, FONT_ID_MAIN_REGULAR);
+      win_draw_string(win_info, 16, 86, "Scheduler: active", 0xFFFFFFFF, FONT_ID_MAIN_REGULAR);
       win_update(win_info);
     }
-    compositor_start();
     sched_create_task(compositor_thread);
   }
 
