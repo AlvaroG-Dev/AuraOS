@@ -4,6 +4,7 @@ on:
   push:
     branches: [main, phase-a-foundation]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   build-and-smoke-test:
@@ -19,6 +20,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc make nasm gnu-efi mtools dosfstools qemu-system-x86 ovmf
 
+      - name: Verify repository OVMF firmware
+        run: |
+          test -f OVMF_CODE.fd
+          test -f OVMF_VARS.fd
+          echo "OVMF_CODE.fd: OK"
+          echo "OVMF_VARS.fd: OK"
+
       - name: Build AuraOS
         run: make clean && make
 
@@ -31,13 +39,21 @@ jobs:
           status=${PIPESTATUS[0]}
           set -e
 
-          # AuraOS is intentionally left running, so timeout(124) is expected.
           if [ "$status" -ne 124 ]; then
             echo "QEMU exited unexpectedly with status $status"
+            cat qemu.log
             exit 1
           fi
 
           grep -Fq "[PMM] Bitmap" qemu.log
           grep -Fq "[HEAP] Heap inicializado" qemu.log
-          grep -Fq "[INIT] Iniciando Scheduler" qemu.log
+          grep -Fq "[SELFTEST] Todos los tests de memoria: OK" qemu.log
+          grep -Fq "[INIT] Aurora OS listo. Multitarea activa." qemu.log
+          grep -Fq "[COMPOSITOR] Motor grafico con aceleracion SIMD SSE2 inicializado." qemu.log
+          grep -Fq "[COMP] Compositor thread started" qemu.log
+          grep -Fq "[TASK-A] vivo" qemu.log
+          grep -Fq "[TASK-B] vivo" qemu.log
+          ! grep -Fq "EXCEPCION" qemu.log
+          ! grep -Fq "General protection fault" qemu.log
+          ! grep -Fq "Invalid Opcode" qemu.log
           echo "AuraOS boot smoke test: OK"
