@@ -8,7 +8,7 @@ CROSS := $(shell which x86_64-elf-gcc 2>/dev/null)
 ifeq ($(CROSS),)
     CC = gcc
     # Flags para compilar kernel con gcc nativo
-    CFLAGS = -ffreestanding -O2 -Wall -Wextra -fno-exceptions -mno-red-zone \
+    CFLAGS = -ffreestanding -O2 -Wall -Wextra -fno-pic -fno-pie -fno-exceptions -mno-red-zone \
              -mcmodel=kernel -fno-stack-protector -fno-asynchronous-unwind-tables \
              -nostdlib -nostartfiles -nodefaultlibs -I.
 else
@@ -18,9 +18,9 @@ else
 endif
 
 LD      = $(CC)
-LDFLAGS = -nostdlib -T linker.ld
+LDFLAGS = -nostdlib -no-pie -T linker.ld
 
-OBJS = boot.o isr_stubs.o switch.o main.o serial.o gdt.o idt.o paging.o pmm.o heap.o sched.o ps2.o rtc.o initrd.o tarfs.o bmp.o \
+OBJS = boot.o isr_stubs.o switch.o main.o selftest.o serial.o gdt.o idt.o paging.o pmm.o heap.o sched.o ps2.o rtc.o initrd.o tarfs.o bmp.o \
        gfx/gfx.o gfx/window.o gfx/compositor.o gfx/taskbar.o gfx/font_aa.o gfx/font_manager.o
 TARGET  = kernel.elf
 

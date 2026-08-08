@@ -8,6 +8,7 @@ KERNEL_VMA = 0xFFFFFFFF80000000;
 SECTIONS
 {
     . = KERNEL_VMA + 0x1000000;
+    _kernel_start = .;
 
     .text : AT(ADDR(.text) - KERNEL_VMA)
     {
@@ -45,7 +46,7 @@ SECTIONS
         *(.note)
         *(.eh_frame)
     }
-    
+
     . = ALIGN(4096);
     _kernel_end = .;
 }
