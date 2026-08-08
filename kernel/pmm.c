@@ -10,6 +10,10 @@ static uint64_t bitmap_size = 0;
 static uint64_t max_blocks = 0;
 static uint64_t used_blocks = 0;
 static uint64_t last_alloc_bit = 0;
+static uint64_t bitmap_phys = 0;
+static uint64_t bitmap_end_phys = 0;
+static uint64_t kernel_start_phys = 0;
+static uint64_t kernel_end_phys = 0;
 static int pmm_ready = 0;
 
 #define EFI_CONVENTIONAL_MEMORY 7
@@ -53,12 +57,23 @@ static void reserve_range(uint64_t start, uint64_t end) {
         reserve_page(bit);
 }
 
+static int page_is_reserved(uint64_t phys_addr) {
+    if (phys_addr == 0) return 1;
+    if (bitmap_phys && phys_addr >= bitmap_phys && phys_addr < bitmap_end_phys) return 1;
+    if (kernel_start_phys && phys_addr >= kernel_start_phys && phys_addr < kernel_end_phys) return 1;
+    return 0;
+}
+
 int pmm_init(uint64_t memmap, uint64_t memmap_size, uint64_t memmap_desc_size) {
     bitmap = 0;
     bitmap_size = 0;
     max_blocks = 0;
     used_blocks = 0;
     last_alloc_bit = 0;
+    bitmap_phys = 0;
+    bitmap_end_phys = 0;
+    kernel_start_phys = 0;
+    kernel_end_phys = 0;
     pmm_ready = 0;
 
     if (!memmap || memmap_size == 0 || memmap_desc_size < EFI_DESCRIPTOR_MIN_SIZE) {
@@ -69,11 +84,14 @@ int pmm_init(uint64_t memmap, uint64_t memmap_size, uint64_t memmap_desc_size) {
     uint8_t *ptr = (uint8_t *)memmap;
     uint64_t max_phys_addr = 0;
 
+    // El bitmap solo necesita representar RAM que el PMM pueda entregar.
+    // No debemos dimensionarlo hasta el ultimo descriptor EFI de cualquier tipo
+    // (que en QEMU puede llegar a 1 TiB aunque solo haya 512 MiB de RAM).
     for (uint64_t offset = 0; offset + memmap_desc_size <= memmap_size; offset += memmap_desc_size) {
         uint32_t type = *(uint32_t *)(ptr + offset);
         uint64_t phys = *(uint64_t *)(ptr + offset + 8);
         uint64_t pages = *(uint64_t *)(ptr + offset + 24);
-        (void)type;
+        if (type != EFI_CONVENTIONAL_MEMORY || pages == 0) continue;
         if (pages > UINT64_MAX / PAGE_SIZE) continue;
 
         uint64_t length = pages * PAGE_SIZE;
@@ -83,17 +101,15 @@ int pmm_init(uint64_t memmap, uint64_t memmap_size, uint64_t memmap_desc_size) {
     }
 
     if (max_phys_addr < PAGE_SIZE) {
-        serial_puts("[PMM] ERROR: no se encontro RAM fisica\n");
+        serial_puts("[PMM] ERROR: no se encontro RAM convencional\n");
         return -1;
     }
 
-    uint64_t rounded_max = max_phys_addr - 1;
-    if (rounded_max > UINT64_MAX - PAGE_SIZE) return -1;
-    max_blocks = (rounded_max + PAGE_SIZE) / PAGE_SIZE;
+    max_blocks = (max_phys_addr + PAGE_SIZE - 1) / PAGE_SIZE;
     if (max_blocks > UINT64_MAX - 7) return -1;
     bitmap_size = (max_blocks + 7) / 8;
 
-    uint64_t bitmap_phys = 0;
+    // El bitmap debe vivir dentro de una region que UEFI haya marcado como usable.
     for (uint64_t offset = 0; offset + memmap_desc_size <= memmap_size; offset += memmap_desc_size) {
         uint32_t type = *(uint32_t *)(ptr + offset);
         uint64_t phys = *(uint64_t *)(ptr + offset + 8);
@@ -108,6 +124,7 @@ int pmm_init(uint64_t memmap, uint64_t memmap_size, uint64_t memmap_desc_size) {
         uint64_t candidate_end = phys + bitmap_size;
         if (candidate_end <= end_addr && candidate_end <= BITMAP_MAX_PHYS) {
             bitmap_phys = phys;
+            bitmap_end_phys = candidate_end;
             break;
         }
     }
@@ -121,6 +138,8 @@ int pmm_init(uint64_t memmap, uint64_t memmap_size, uint64_t memmap_desc_size) {
     for (uint64_t i = 0; i < bitmap_size; i++) bitmap[i] = 0xFF;
     used_blocks = max_blocks;
 
+    // Solo las paginas realmente convencionales quedan libres. Todo lo demas
+    // permanece reservado, incluyendo MMIO y huecos del mapa EFI.
     for (uint64_t offset = 0; offset + memmap_desc_size <= memmap_size; offset += memmap_desc_size) {
         uint32_t type = *(uint32_t *)(ptr + offset);
         uint64_t phys = *(uint64_t *)(ptr + offset + 8);
@@ -128,7 +147,8 @@ int pmm_init(uint64_t memmap, uint64_t memmap_size, uint64_t memmap_desc_size) {
         if (type != EFI_CONVENTIONAL_MEMORY || pages == 0) continue;
 
         uint64_t start_bit = phys / PAGE_SIZE;
-        if (start_bit >= max_blocks || pages > max_blocks - start_bit)
+        if (start_bit >= max_blocks) continue;
+        if (pages > max_blocks - start_bit)
             pages = max_blocks - start_bit;
 
         for (uint64_t b = 0; b < pages; b++) {
@@ -144,22 +164,22 @@ int pmm_init(uint64_t memmap, uint64_t memmap_size, uint64_t memmap_desc_size) {
     uint64_t kernel_start = (uint64_t)&_kernel_start;
     uint64_t kernel_end = (uint64_t)&_kernel_end;
     if (kernel_start >= KERNEL_VMA && kernel_end > kernel_start) {
-        reserve_range(kernel_start - KERNEL_VMA, kernel_end - KERNEL_VMA);
+        kernel_start_phys = kernel_start - KERNEL_VMA;
+        kernel_end_phys = kernel_end - KERNEL_VMA;
+        reserve_range(kernel_start_phys, kernel_end_phys);
     }
 
-    uint64_t bitmap_end;
-    if (!range_end(bitmap_phys, bitmap_size, &bitmap_end)) return -1;
-    reserve_range(bitmap_phys, bitmap_end);
+    reserve_range(bitmap_phys, bitmap_end_phys);
 
     last_alloc_bit = 0;
     pmm_ready = 1;
 
     serial_puts("[PMM] Bitmap: 0x");
     serial_hex(bitmap_phys);
-    serial_puts(" | Max RAM: ");
+    serial_puts(" | Max RAM convencional: ");
     serial_putn(max_phys_addr / (1024 * 1024), 10, 0);
     serial_puts(" MB | Libres: ");
-    serial_putn((max_blocks - used_blocks) * 4 / 1024, 10, 0);
+    serial_putn((max_blocks - used_blocks) * PAGE_SIZE / (1024 * 1024), 10, 0);
     serial_puts(" MB\n");
     return 0;
 }
@@ -194,6 +214,11 @@ void pmm_free_page(uint64_t phys_addr) {
     uint64_t bit = phys_addr / PAGE_SIZE;
     if (bit >= max_blocks || !BITMAP_TEST(bitmap, bit))
         return;
+
+    if (page_is_reserved(phys_addr)) {
+        serial_puts("[PMM] ERROR: intento de liberar una pagina reservada\n");
+        return;
+    }
 
     BITMAP_CLEAR(bitmap, bit);
     if (used_blocks > 0) used_blocks--;
