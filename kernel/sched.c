@@ -16,10 +16,15 @@ static uint32_t next_id = 0;
 static uint32_t tick_counter = 0;
 
 void task_entry_wrapper(void (*fn)(void)) {
+  /* The first task entry is deliberately kept interrupt-disabled until the
+   * C entry point is established. This prevents a nested PIT IRQ from
+   * switching away before the task has executed its first instruction. */
+  serial_puts("[TASK] Entry wrapper\n");
+  __asm__ volatile("sti" ::: "memory");
   fn();
   current_task->state = TASK_DEAD;
   sched_yield();
-  while (1) { __asm__ volatile("hlt"); }
+  while (1) { __asm__ volatile("cli; hlt"); }
 }
 
 void sched_init(void) {
@@ -54,13 +59,13 @@ task_t *sched_create_task(void (*fn)(void)) {
   stack_top &= ~0xFULL;
   uint64_t *sp = (uint64_t *)stack_top;
 
-  *(--sp) = (uint64_t)task_trampoline; /* RET target */
-  *(--sp) = 0;                          /* rbx */
-  *(--sp) = 0;                          /* rbp */
-  *(--sp) = (uint64_t)fn;               /* r12 */
-  *(--sp) = 0;                          /* r13 */
-  *(--sp) = 0;                          /* r14 */
-  *(--sp) = 0;                          /* r15 */
+  *(--sp) = (uint64_t)task_trampoline;
+  *(--sp) = 0;
+  *(--sp) = 0;
+  *(--sp) = (uint64_t)fn;
+  *(--sp) = 0;
+  *(--sp) = 0;
+  *(--sp) = 0;
 
   task->rsp = (uint64_t)sp;
   task->stack = (uint64_t *)stack;
