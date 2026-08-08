@@ -55,26 +55,44 @@ jobs:
           status=${PIPESTATUS[0]}
           set -e
 
+          # Always resolve kernel RIPs when an exception was reported. This lets
+          # us map a bare-metal fault directly back to the source line without
+          # requiring a local toolchain on the developer machine.
+          if grep -q '\[!] EXCEPCION #' qemu.log; then
+            echo "===== AuraOS exception symbolication ====="
+            while IFS= read -r rip; do
+              if [ -n "$rip" ]; then
+                echo "RIP=$rip"
+                addr2line -e kernel/kernel.elf -f -C "$rip" || true
+                objdump -d --no-show-raw-insn --start-address="$rip" --stop-address=$((rip + 16)) kernel/kernel.elf || true
+              fi
+            done < <(sed -n 's/.*RIP: \(0x[0-9A-Fa-f]*\).*/\1/p' qemu.log)
+            echo "===== End exception symbolication ====="
+          fi
+
           if [ "$status" -ne 124 ]; then
             echo "QEMU exited unexpectedly with status $status"
             cat qemu.log
             exit 1
           fi
 
-          # Boot invariants.
           grep -Fq "[PMM] Bitmap" qemu.log
           grep -Fq "[HEAP] Heap inicializado" qemu.log
           grep -Fq "[INIT] Iniciando Scheduler" qemu.log
           grep -Fq "[INIT] Aurora OS listo. Multitarea activa." qemu.log
-
-          # Memory self-tests are mandatory: a missing or failed test fails CI.
           grep -Fq "[SELFTEST][PMM] 256 alloc/write/verify/free: OK" qemu.log
-          grep -Fq "[SELFTEST][HEAP] 128 fragmented alloc/free cycles: OK" qemu.log
+          grep -Fq "[SELFTEST][HEAP] allocation isolation: OK" qemu.log
+          grep -Fq "[SELFTEST][HEAP] 128 isolation/fragmentation/reuse cycles: OK" qemu.log
           grep -Fq "[SELFTEST] Todos los tests de memoria: OK" qemu.log
 
-          # No explicit memory/self-test failure may be present.
           if grep -Eq '\[SELFTEST\].*(FAIL|FALLO)|\[PMM\] ERROR|\[HEAP\] (ERROR|CORRUPCION)' qemu.log; then
             echo "Memory integrity failure detected"
+            cat qemu.log
+            exit 1
+          fi
+
+          if grep -q '\[!] EXCEPCION #' qemu.log; then
+            echo "AuraOS reported a CPU exception"
             cat qemu.log
             exit 1
           fi
