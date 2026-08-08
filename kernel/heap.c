@@ -7,7 +7,7 @@
 
 #define HEAP_GROW_PAGES 4
 #define HEAP_ALIGNMENT 16
-#define HEAP_MAGIC 0x4155524148454150ULL /* "AURAHEAP" */
+#define HEAP_MAGIC 0x4155524148454150ULL
 
 typedef struct block_header {
   uint64_t magic;
@@ -27,34 +27,31 @@ static uint64_t heap_start = 0;
 static uint64_t heap_bytes = 0;
 
 static int block_is_valid(const block_header_t *blk) {
-  if (!blk || blk->magic != HEAP_MAGIC)
-    return 0;
-  if ((uint64_t)blk < heap_start || (uint64_t)blk >= heap_top)
-    return 0;
-  if (blk->size > heap_top - (uint64_t)blk - HEADER_SIZE)
-    return 0;
+  uint64_t addr;
+  if (!blk || blk->magic != HEAP_MAGIC) return 0;
+  addr = (uint64_t)blk;
+  if (addr < heap_start || addr >= heap_top) return 0;
+  // Check the header fits before doing any subtraction involving heap_top.
+  if (heap_top - addr < HEADER_SIZE) return 0;
+  if (blk->size > heap_top - addr - HEADER_SIZE) return 0;
+  if (blk->next && ((uint64_t)blk->next < heap_start || (uint64_t)blk->next >= heap_top)) return 0;
   return 1;
 }
 
 static block_header_t *find_block_for_payload(void *ptr) {
   block_header_t *cur = heap_head;
   while (cur) {
-    if (!block_is_valid(cur))
-      return NULL;
-    if ((uint8_t *)cur + HEADER_SIZE == (uint8_t *)ptr)
-      return cur;
+    if (!block_is_valid(cur)) return NULL;
+    if ((uint8_t *)cur + HEADER_SIZE == (uint8_t *)ptr) return cur;
     cur = cur->next;
   }
   return NULL;
 }
 
 static block_header_t *heap_grow(size_t pages) {
-  if (pages == 0 || pages > (UINT64_MAX / PAGE_SIZE))
-    return NULL;
-
+  if (pages == 0 || pages > (UINT64_MAX / PAGE_SIZE)) return NULL;
   uint64_t bytes = (uint64_t)pages * PAGE_SIZE;
-  if (heap_top > UINT64_MAX - bytes)
-    return NULL;
+  if (heap_top > UINT64_MAX - bytes) return NULL;
 
   uint64_t vaddr = heap_top;
   if (vmm_alloc_pages(vaddr, pages, PTE_WRITABLE) != 0) {
@@ -64,7 +61,6 @@ static block_header_t *heap_grow(size_t pages) {
 
   heap_top += bytes;
   heap_bytes += bytes;
-
   block_header_t *blk = (block_header_t *)vaddr;
   blk->magic = HEAP_MAGIC;
   blk->size = bytes - HEADER_SIZE;
@@ -85,7 +81,6 @@ static block_header_t *heap_grow(size_t pages) {
     }
     cur->next = blk;
   }
-
   return blk;
 }
 
@@ -97,9 +92,12 @@ static void coalesce(void) {
       serial_puts("[HEAP] CORRUPCION: bloque invalido durante coalesce\n");
       return;
     }
-
     uint8_t *cur_end = (uint8_t *)cur + HEADER_SIZE + cur->size;
     if (cur->is_free && next->is_free && cur_end == (uint8_t *)next) {
+      if (next->size > SIZE_MAX - HEADER_SIZE - cur->size) {
+        serial_puts("[HEAP] CORRUPCION: overflow durante coalesce\n");
+        return;
+      }
       cur->size += HEADER_SIZE + next->size;
       cur->next = next->next;
       continue;
@@ -113,21 +111,17 @@ void heap_init(void) {
   heap_top = HEAP_VMA;
   heap_bytes = 0;
   heap_head = NULL;
-
   if (!heap_grow(HEAP_GROW_PAGES)) {
     serial_puts("[HEAP] ERROR: no se pudo crear el heap inicial\n");
     return;
   }
-
   serial_puts("[HEAP] Heap inicializado en 0x");
   serial_hex(HEAP_VMA);
   serial_puts("\n");
 }
 
 void *kmalloc(size_t size) {
-  if (size == 0 || size > SIZE_MAX - (HEAP_ALIGNMENT - 1))
-    return NULL;
-
+  if (size == 0 || size > SIZE_MAX - (HEAP_ALIGNMENT - 1)) return NULL;
   size = (size + (HEAP_ALIGNMENT - 1)) & ~(size_t)(HEAP_ALIGNMENT - 1);
 
   for (block_header_t *cur = heap_head; cur; cur = cur->next) {
@@ -135,10 +129,10 @@ void *kmalloc(size_t size) {
       serial_puts("[HEAP] CORRUPCION: bloque invalido en kmalloc\n");
       return NULL;
     }
-    if (!cur->is_free || cur->size < size)
-      continue;
+    if (!cur->is_free || cur->size < size) continue;
 
-    if (cur->size >= size + HEADER_SIZE + HEAP_ALIGNMENT) {
+    // Use subtraction for the split test so large sizes cannot overflow.
+    if (cur->size - size >= HEADER_SIZE + HEAP_ALIGNMENT) {
       block_header_t *split = (block_header_t *)((uint8_t *)cur + HEADER_SIZE + size);
       split->magic = HEAP_MAGIC;
       split->size = cur->size - size - HEADER_SIZE;
@@ -148,20 +142,19 @@ void *kmalloc(size_t size) {
       cur->size = size;
       cur->next = split;
     }
-
     cur->is_free = 0;
     return (uint8_t *)cur + HEADER_SIZE;
   }
 
+  // Avoid size + HEADER_SIZE + PAGE_SIZE - 1 overflowing.
+  if (size > SIZE_MAX - HEADER_SIZE - (PAGE_SIZE - 1)) return NULL;
   size_t pages_needed = (size + HEADER_SIZE + PAGE_SIZE - 1) / PAGE_SIZE;
-  if (pages_needed < HEAP_GROW_PAGES)
-    pages_needed = HEAP_GROW_PAGES;
+  if (pages_needed < HEAP_GROW_PAGES) pages_needed = HEAP_GROW_PAGES;
 
   block_header_t *new_blk = heap_grow(pages_needed);
-  if (!new_blk)
-    return NULL;
+  if (!new_blk) return NULL;
 
-  if (new_blk->size >= size + HEADER_SIZE + HEAP_ALIGNMENT) {
+  if (new_blk->size - size >= HEADER_SIZE + HEAP_ALIGNMENT) {
     block_header_t *split = (block_header_t *)((uint8_t *)new_blk + HEADER_SIZE + size);
     split->magic = HEAP_MAGIC;
     split->size = new_blk->size - size - HEADER_SIZE;
@@ -171,20 +164,16 @@ void *kmalloc(size_t size) {
     new_blk->size = size;
     new_blk->next = split;
   }
-
   new_blk->is_free = 0;
   return (uint8_t *)new_blk + HEADER_SIZE;
 }
 
 void kfree(void *ptr) {
-  if (!ptr)
-    return;
-
+  if (!ptr) return;
   if (((uint64_t)ptr & (HEAP_ALIGNMENT - 1)) != 0) {
     serial_puts("[HEAP] ERROR: kfree recibe un puntero no alineado\n");
     return;
   }
-
   block_header_t *blk = find_block_for_payload(ptr);
   if (!blk) {
     serial_puts("[HEAP] ERROR: kfree recibe un puntero desconocido\n");
@@ -194,7 +183,6 @@ void kfree(void *ptr) {
     serial_puts("[HEAP] ERROR: double-free detectado\n");
     return;
   }
-
   blk->is_free = 1;
   coalesce();
 }
@@ -208,12 +196,9 @@ void heap_dump(void) {
       serial_puts("  [HEAP] CORRUPCION\n");
       return;
     }
-    serial_puts("  [");
-    serial_putn(idx++, 10, 0);
-    serial_puts("] addr=0x");
-    serial_hex((uint64_t)cur);
-    serial_puts(" size=");
-    serial_putn(cur->size, 10, 0);
+    serial_puts("  ["); serial_putn(idx++, 10, 0);
+    serial_puts("] addr=0x"); serial_hex((uint64_t)cur);
+    serial_puts(" size="); serial_putn(cur->size, 10, 0);
     serial_puts(cur->is_free ? " FREE\n" : " USED\n");
     cur = cur->next;
   }
