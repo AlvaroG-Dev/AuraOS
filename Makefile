@@ -1,7 +1,10 @@
 # Makefile global - AuraOS
 
-OVMF_CODE ?= OVMF_CODE.fd
-OVMF_VARS ?= OVMF_VARS.fd
+# Firmware OVMF is always resolved from the project root. Using CURDIR avoids
+# depending on the runner's /usr/share layout and also makes `make run` behave
+# identically locally and in CI.
+OVMF_CODE = $(CURDIR)/OVMF_CODE.fd
+OVMF_VARS = $(CURDIR)/OVMF_VARS.fd
 
 .PHONY: all bootloader kernel image run run-debug clean sysroot
 
@@ -34,11 +37,13 @@ image: bootloader kernel
 	dd if=/dev/zero of=aurora.img bs=1M count=64
 	mkfs.fat -F 32 aurora.img
 	mcopy -i aurora.img -s esp/EFI ::
-	mcopy -i aurora.img -s esp/kernel.elf ::
+	mcopy -i aurora.img -s kernel/kernel.elf ::
 
 run: image
-	@test -f $(OVMF_VARS) || (echo "ERROR: $(OVMF_VARS) no encontrado" && exit 1)
-	@test -f $(OVMF_CODE) || (echo "ERROR: $(OVMF_CODE) no encontrado" && exit 1)
+	@test -f "$(OVMF_VARS)" || (echo "ERROR: $(OVMF_VARS) no encontrado en la raiz del proyecto" && exit 1)
+	@test -f "$(OVMF_CODE)" || (echo "ERROR: $(OVMF_CODE) no encontrado en la raiz del proyecto" && exit 1)
+	@echo "[QEMU] OVMF_CODE=$(OVMF_CODE)"
+	@echo "[QEMU] OVMF_VARS=$(OVMF_VARS)"
 	qemu-system-x86_64 \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 		-drive if=pflash,format=raw,file=$(OVMF_VARS) \
