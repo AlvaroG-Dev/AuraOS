@@ -16,9 +16,6 @@ static uint32_t next_id = 0;
 static uint32_t tick_counter = 0;
 
 void task_entry_wrapper(void (*fn)(void)) {
-  /* The first task entry is deliberately kept interrupt-disabled until the
-   * C entry point is established. This prevents a nested PIT IRQ from
-   * switching away before the task has executed its first instruction. */
   serial_puts("[TASK] Entry wrapper\n");
   __asm__ volatile("sti" ::: "memory");
   fn();
@@ -51,21 +48,21 @@ task_t *sched_create_task(void (*fn)(void)) {
     return NULL;
   }
 
-  /* task_switch pops r15..rbx, then RETs to task_trampoline.
-   * The RET leaves RSP 16-byte aligned. The subsequent CALL pushes
-   * its return address, so task_entry_wrapper enters with RSP % 16 == 8,
-   * exactly as required by the System V AMD64 ABI. */
+  /* task_switch expects the saved context in exactly this order:
+   *   r15, r14, r13, r12, rbp, rbx, return_address
+   * because task_switch pops r15..rbx and then executes RET.
+   * Keep the initial frame identical to a real saved context. */
   uint64_t stack_top = (uint64_t)(stack + TASK_STACK_SIZE);
   stack_top &= ~0xFULL;
   uint64_t *sp = (uint64_t *)stack_top;
 
-  *(--sp) = (uint64_t)task_trampoline;
-  *(--sp) = 0;
-  *(--sp) = 0;
-  *(--sp) = (uint64_t)fn;
-  *(--sp) = 0;
-  *(--sp) = 0;
-  *(--sp) = 0;
+  *(--sp) = 0;                          /* r15 */
+  *(--sp) = 0;                          /* r14 */
+  *(--sp) = 0;                          /* r13 */
+  *(--sp) = (uint64_t)fn;               /* r12: task argument */
+  *(--sp) = 0;                          /* rbp */
+  *(--sp) = 0;                          /* rbx */
+  *(--sp) = (uint64_t)task_trampoline;  /* RET target */
 
   task->rsp = (uint64_t)sp;
   task->stack = (uint64_t *)stack;
