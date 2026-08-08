@@ -43,15 +43,30 @@ static EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = NULL;
 static EFI_LOADED_IMAGE *loaded_image = NULL;
 static EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fs = NULL;
 
+/* The returned MapKey is valid only for the immediately preceding final
+ * GetMemoryMap(). No Boot Services allocation is allowed after it. */
 static EFI_STATUS get_memory_map(EFI_HANDLE image_handle) {
+    (void)image_handle;
     EFI_STATUS status;
-    mem_map.map_size = 0;
-    status = uefi_call_wrapper(BS->GetMemoryMap, 5, &mem_map.map_size, NULL, &mem_map.map_key, &mem_map.desc_size, &mem_map.desc_version);
+    UINTN required = 0;
+    UINTN capacity;
+
+    status = uefi_call_wrapper(BS->GetMemoryMap, 5, &required, NULL,
+                               &mem_map.map_key, &mem_map.desc_size,
+                               &mem_map.desc_version);
     if (status != EFI_BUFFER_TOO_SMALL) return status;
-    mem_map.map_size += 4 * mem_map.desc_size;
-    status = uefi_call_wrapper(BS->AllocatePool, 3, EfiLoaderData, mem_map.map_size, (VOID**)&mem_map.map);
+
+    /* Leave enough room for allocations performed before this final query. */
+    capacity = required + 16 * mem_map.desc_size;
+    status = uefi_call_wrapper(BS->AllocatePool, 3, EfiLoaderData,
+                               capacity, (VOID**)&mem_map.map);
     if (EFI_ERROR(status)) return status;
-    return uefi_call_wrapper(BS->GetMemoryMap, 5, &mem_map.map_size, mem_map.map, &mem_map.map_key, &mem_map.desc_size, &mem_map.desc_version);
+
+    mem_map.map_size = capacity;
+    status = uefi_call_wrapper(BS->GetMemoryMap, 5, &mem_map.map_size,
+                               mem_map.map, &mem_map.map_key,
+                               &mem_map.desc_size, &mem_map.desc_version);
+    return status;
 }
 
 static EFI_STATUS map_page_4k(UINT64 *pml4, EFI_PHYSICAL_ADDRESS virt, EFI_PHYSICAL_ADDRESS phys) {
@@ -87,7 +102,6 @@ static EFI_STATUS load_kernel(EFI_FILE *root, VOID **entry_point, UINT64 *pml4) 
     if (ehdr.e_machine != EM_X86_64) { Print(L"[BOOT] ELF no es x86_64 (machine=%d)\n", ehdr.e_machine); status = EFI_UNSUPPORTED; goto cleanup; }
     if (ehdr.e_type != ET_EXEC) { Print(L"[BOOT] ELF no es ET_EXEC (type=%d)\n", ehdr.e_type); status = EFI_UNSUPPORTED; goto cleanup; }
 
-    // PT_LOAD pueden compartir paginas virtuales. Cargamos todo el rango en un unico bloque fisico.
     UINT64 image_min = UINT64_MAX, image_max = 0; UINTN load_count = 0;
     for (UINTN i = 0; i < ehdr.e_phnum; i++) {
         struct Elf64_Phdr phdr; UINTN n = sizeof(phdr);
@@ -154,11 +168,6 @@ static EFI_STATUS build_page_tables(EFI_PHYSICAL_ADDRESS *pml4_out) {
     pml4[511] = pdpt_addr | 3; *pml4_out = pml4_addr; return EFI_SUCCESS;
 }
 
-static EFI_STATUS copy_memory_map(VOID **map_out, UINTN *map_size_out, UINTN *desc_size_out, UINT32 *desc_ver_out) {
-    UINTN size = mem_map.map_size; EFI_STATUS status = uefi_call_wrapper(BS->AllocatePool, 3, EfiLoaderData, size, map_out); if (EFI_ERROR(status)) return status;
-    CopyMem(*map_out, mem_map.map, size); *map_size_out = size; *desc_size_out = mem_map.desc_size; *desc_ver_out = mem_map.desc_version; return EFI_SUCCESS;
-}
-
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *system_table) {
     InitializeLib(image_handle, system_table); Print(L"\n=== AURORA OS BOOTLOADER ===\n"); EFI_STATUS status;
     status = uefi_call_wrapper(BS->HandleProtocol, 3, image_handle, &LoadedImageProtocol, (VOID**)&loaded_image); if (EFI_ERROR(status)) return status;
@@ -167,14 +176,57 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *system_tab
     setup_framebuffer();
     EFI_PHYSICAL_ADDRESS pml4_addr = 0; status = build_page_tables(&pml4_addr); if (EFI_ERROR(status)) { Print(L"[BOOT] Error construyendo tablas de pagina: %r\n", status); return status; }
     VOID *entry_point = NULL; status = load_kernel(root, &entry_point, (UINT64*)pml4_addr); if (EFI_ERROR(status)) return status;
-    VOID *map_copy = NULL; UINTN map_size = 0, desc_size = 0; UINT32 desc_ver = 0;
-    status = copy_memory_map(&map_copy, &map_size, &desc_size, &desc_ver); if (EFI_ERROR(status)) { Print(L"[BOOT] Error copiando memmap: %r\n", status); return status; }
-    struct kernel_boot_info *boot_info = NULL; status = uefi_call_wrapper(BS->AllocatePool, 3, EfiLoaderData, sizeof(*boot_info), (VOID**)&boot_info); if (EFI_ERROR(status)) return status;
-    boot_info->fb_base = gop ? gop->Mode->FrameBufferBase : 0; boot_info->fb_size = gop ? gop->Mode->FrameBufferSize : 0; boot_info->fb_width = gop ? gop->Mode->Info->HorizontalResolution : 0; boot_info->fb_height = gop ? gop->Mode->Info->VerticalResolution : 0; boot_info->fb_pitch = gop ? gop->Mode->Info->PixelsPerScanLine * 4 : 0; boot_info->fb_bpp = 32;
-    boot_info->memmap = (uint64_t)map_copy; boot_info->memmap_size = map_size; boot_info->memmap_desc_size = desc_size; boot_info->memmap_desc_ver = desc_ver;
-    UINT8 *stack = NULL; status = uefi_call_wrapper(BS->AllocatePool, 3, EfiLoaderData, 16384, (VOID**)&stack); if (EFI_ERROR(status)) return status; UINT64 stack_top = ((UINT64)stack + 16384) & ~0xFULL;
-    status = uefi_call_wrapper(BS->ExitBootServices, 2, image_handle, mem_map.map_key); if (EFI_ERROR(status)) { Print(L"[BOOT] ExitBootServices fallo: %r\n", status); return status; }
-    __asm__ volatile("mov %0, %%cr3" : : "r"((UINT64)pml4_addr) : "memory"); __asm__ volatile("mov %0, %%rsp" : : "r"(stack_top) : "memory");
-    typedef void (*kernel_entry_t)(struct kernel_boot_info*); kernel_entry_t entry = (kernel_entry_t)entry_point;
-    Print(L"[BOOT] Tablas de pagina listas. Memmap copiado.\n"); Print(L"[BOOT] Saltando al kernel...\n"); entry(boot_info); return EFI_SUCCESS;
+
+    /* All Boot Services allocations must happen before the final memory-map query. */
+    struct kernel_boot_info *boot_info = NULL;
+    status = uefi_call_wrapper(BS->AllocatePool, 3, EfiLoaderData, sizeof(*boot_info), (VOID**)&boot_info);
+    if (EFI_ERROR(status)) return status;
+    UINT8 *stack = NULL;
+    status = uefi_call_wrapper(BS->AllocatePool, 3, EfiLoaderData, 16384, (VOID**)&stack);
+    if (EFI_ERROR(status)) return status;
+    UINT64 stack_top = ((UINT64)stack + 16384) & ~0xFULL;
+
+    /* This must be the final GetMemoryMap() before ExitBootServices(). */
+    status = get_memory_map(image_handle);
+    if (EFI_ERROR(status)) { Print(L"[BOOT] Error obteniendo memmap final: %r\n", status); return status; }
+
+    boot_info->fb_base = gop ? gop->Mode->FrameBufferBase : 0;
+    boot_info->fb_size = gop ? gop->Mode->FrameBufferSize : 0;
+    boot_info->fb_width = gop ? gop->Mode->Info->HorizontalResolution : 0;
+    boot_info->fb_height = gop ? gop->Mode->Info->VerticalResolution : 0;
+    boot_info->fb_pitch = gop ? gop->Mode->Info->PixelsPerScanLine * 4 : 0;
+    boot_info->fb_bpp = 32;
+    boot_info->memmap = (uint64_t)mem_map.map;
+    boot_info->memmap_size = mem_map.map_size;
+    boot_info->memmap_desc_size = mem_map.desc_size;
+    boot_info->memmap_desc_ver = mem_map.desc_version;
+
+    /* Do not call any allocation-capable Boot Service between the final
+     * GetMemoryMap() and ExitBootServices(). */
+    status = uefi_call_wrapper(BS->ExitBootServices, 2, image_handle, mem_map.map_key);
+    if (status == EFI_INVALID_PARAMETER) {
+        /* A firmware is allowed to change the map between GetMemoryMap and
+         * ExitBootServices. Retry with a fresh map, but the retry buffer is
+         * already allocated and therefore no allocation is needed here. */
+        UINTN retry_size = mem_map.map_size;
+        status = uefi_call_wrapper(BS->GetMemoryMap, 5, &retry_size, mem_map.map,
+                                   &mem_map.map_key, &mem_map.desc_size,
+                                   &mem_map.desc_version);
+        if (!EFI_ERROR(status)) {
+            mem_map.map_size = retry_size;
+            boot_info->memmap = (uint64_t)mem_map.map;
+            boot_info->memmap_size = retry_size;
+            boot_info->memmap_desc_size = mem_map.desc_size;
+            boot_info->memmap_desc_ver = mem_map.desc_version;
+            status = uefi_call_wrapper(BS->ExitBootServices, 2, image_handle, mem_map.map_key);
+        }
+    }
+    if (EFI_ERROR(status)) { Print(L"[BOOT] ExitBootServices fallo: %r\n", status); return status; }
+
+    __asm__ volatile("mov %0, %%cr3" : : "r"((UINT64)pml4_addr) : "memory");
+    __asm__ volatile("mov %0, %%rsp" : : "r"(stack_top) : "memory");
+    typedef void (*kernel_entry_t)(struct kernel_boot_info*);
+    kernel_entry_t entry = (kernel_entry_t)entry_point;
+    entry(boot_info);
+    return EFI_SUCCESS;
 }
