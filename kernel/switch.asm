@@ -7,7 +7,12 @@ bits 64
 global task_switch
 
 task_switch:
-    ; Guardar registros callee-saved.
+    ; El cambio de contexto debe ser atómico respecto a IRQs. Esto también
+    ; garantiza que una tarea recién creada llegue al trampoline con IF=0,
+    ; independientemente de si el switch fue provocado por PIT o yield().
+    cli
+
+    ; Guardar registros callee-saved de la tarea actual.
     push rbx
     push rbp
     push r12
@@ -15,7 +20,7 @@ task_switch:
     push r14
     push r15
 
-    ; Guardar RSP actual antes de tocar el estado de la tarea.
+    ; Guardar RSP actual antes de cambiar al estado de la nueva tarea.
     mov [rdi], rsp
 
     ; Restaurar contexto de la nueva tarea.
@@ -34,11 +39,9 @@ global task_trampoline
 extern task_entry_wrapper
 
 task_trampoline:
-    ; Entramos aquí con IF=0 porque el cambio inicial procede del IRQ/PIT.
-    ; NO habilitamos interrupciones antes de entrar en C: hacerlo aquí permite
-    ; que un IRQ anidado observe una tarea parcialmente inicializada.
-    ; task_entry_wrapper habilita las interrupciones una vez establecida la
-    ; entrada C y la tarea ya está marcada como RUNNING.
+    ; IF permanece desactivado hasta que task_entry_wrapper haya establecido
+    ; el contexto C de forma segura.
+    cld
     mov rdi, r12
     call task_entry_wrapper
 .hang:
