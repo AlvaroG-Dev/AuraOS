@@ -148,7 +148,10 @@ volatile uint64_t tick_count = 0;
 static void timer_handler(void) {
   tick_count++;
   if (tick_count % PIT_HZ == 0) compositor_notify_clock_tick();
-  sched_tick();
+  /* No context-switching from an IRQ handler: irq_common has an interrupt
+   * frame on the current stack, and task_switch changes RSP. Returning with
+   * iretq after such a switch would interpret the new task stack as an IRQ
+   * frame and causes #GP/#PF. Scheduling is cooperative in normal context. */
 }
 
 void kmain(struct kernel_boot_info *kinfo) {
@@ -179,7 +182,7 @@ void kmain(struct kernel_boot_info *kinfo) {
 
   serial_puts("[INIT] Iniciando Heap (kmalloc)...\n"); heap_init();
   if (!selftest_memory()) {
-    serial_puts("[SELFTEST] FALLO CRITICO: abortando arranque\n"); return;
+    serial_puts("[SELFTEST] FALLO CRITICO: memoria no supera los tests\n"); return;
   }
 
   pit_init();
@@ -224,8 +227,7 @@ void kmain(struct kernel_boot_info *kinfo) {
     fb_puts(win_x + 10, win_y + 8, "Terminal", 0xFFFFFF, 0x2D2D44);
     fb_puts(win_x + 10, win_y + 45, "Aurora OS v0.1.0", 0x00FF88, 0x1E1E2E);
     fb_puts(win_x + 10, win_y + 65, "x86_64 Bare Metal", 0xAAAAAA, 0x1E1E2E);
-    fb_puts(win_x + 10, win_y + 85,
-            "GDT:OK | IDT:OK | PMM:OK | VMM:OK | HEAP:OK | SCHED:OK", 0xAAAAAA, 0x1E1E2E);
+    fb_puts(win_x + 10, win_y + 85, "GDT:OK | IDT:OK | PMM:OK | VMM:OK | HEAP:OK | SCHED:OK", 0xAAAAAA, 0x1E1E2E);
     fb_puts(win_x + 10, win_y + 105, "Timer: Running | Keyboard: Active", 0xAAAAAA, 0x1E1E2E);
 
     uint64_t test_page = pmm_alloc_page();
@@ -278,6 +280,9 @@ void kmain(struct kernel_boot_info *kinfo) {
       }
     }
     ps2_process();
+    /* Context switches happen only in normal execution context, never from
+     * inside irq_common. This first yield also starts the first READY task. */
+    sched_yield();
     __asm__ volatile("hlt");
   }
 }
