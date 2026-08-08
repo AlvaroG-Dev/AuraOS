@@ -37,7 +37,7 @@ jobs:
             exit 1
           fi
 
-          grep -q "[PMM] Bitmap" qemu.log
-          grep -q "[HEAP] Heap inicializado" qemu.log
-          grep -q "[INIT] Iniciando Scheduler" qemu.log
+          grep -Fq "[PMM] Bitmap" qemu.log
+          grep -Fq "[HEAP] Heap inicializado" qemu.log
+          grep -Fq "[INIT] Iniciando Scheduler" qemu.log
           echo "AuraOS boot smoke test: OK"
