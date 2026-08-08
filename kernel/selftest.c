@@ -12,9 +12,14 @@
 #define HEAP_GUARD_SIZE 16
 #define HEAP_GUARD_A 0xA5
 #define HEAP_GUARD_B 0x5A
+#define HEAP_ALIGNMENT 16
 
 static void fill_bytes(uint8_t *p, size_t n, uint8_t value) {
     for (size_t i = 0; i < n; ++i) p[i] = value;
+}
+
+static size_t align_heap_size(size_t size) {
+    return (size + (HEAP_ALIGNMENT - 1)) & ~(size_t)(HEAP_ALIGNMENT - 1);
 }
 
 static int test_pmm(void) {
@@ -69,6 +74,7 @@ static int test_pmm(void) {
 static int test_heap(void) {
     void *blocks[HEAP_TEST_BLOCKS];
     size_t sizes[HEAP_TEST_BLOCKS];
+    size_t alloc_sizes[HEAP_TEST_BLOCKS];
 
     if (kmalloc(0) != NULL || kmalloc(SIZE_MAX) != NULL) {
         serial_puts("[SELFTEST][HEAP] FAIL: invalid allocation accepted\n");
@@ -77,18 +83,22 @@ static int test_heap(void) {
 
     for (size_t i = 0; i < HEAP_TEST_BLOCKS; ++i) {
         sizes[i] = 1 + ((i * 73) % 4096);
+
+        /* kmalloc() aligns the complete requested payload to 16 bytes.  The
+         * guard must therefore be placed at the end of the actual allocated
+         * payload, not immediately after the logical test payload.  The bytes
+         * between sizes[i] and alloc_sizes[i] are allocator-owned padding. */
+        alloc_sizes[i] = align_heap_size(sizes[i] + HEAP_GUARD_SIZE);
         blocks[i] = kmalloc(sizes[i] + HEAP_GUARD_SIZE);
-        if (!blocks[i] || ((uintptr_t)blocks[i] & 0xFULL) != 0) {
+        if (!blocks[i] || ((uintptr_t)blocks[i] & (HEAP_ALIGNMENT - 1)) != 0) {
             serial_puts("[SELFTEST][HEAP] FAIL: allocation/alignment at block ");
             serial_putn(i, 10, 0); serial_puts("\n");
             for (size_t j = 0; j < i; ++j) kfree(blocks[j]);
             return 0;
         }
 
-        /* Verify that each allocation occupies a unique physical page range.
-         * This catches accidental VMM overlap before payload verification. */
         uint64_t first_phys = paging_get_phys((uint64_t)(uintptr_t)blocks[i]);
-        uint64_t last_addr = (uint64_t)(uintptr_t)blocks[i] + sizes[i] + HEAP_GUARD_SIZE - 1;
+        uint64_t last_addr = (uint64_t)(uintptr_t)blocks[i] + alloc_sizes[i] - 1;
         uint64_t last_phys = paging_get_phys(last_addr);
         if (!first_phys || !last_phys) {
             serial_puts("[SELFTEST][HEAP] FAIL: allocation not mapped at block ");
@@ -100,16 +110,15 @@ static int test_heap(void) {
         uint8_t *p = (uint8_t *)blocks[i];
         p[0] = (uint8_t)i;
         p[sizes[i] - 1] = (uint8_t)(0xFFU - i);
-        fill_bytes(p + sizes[i], HEAP_GUARD_SIZE, HEAP_GUARD_A);
+        fill_bytes(p + alloc_sizes[i] - HEAP_GUARD_SIZE, HEAP_GUARD_SIZE, HEAP_GUARD_A);
 
-        /* Check every previous allocation immediately. If a new allocation
-         * overwrites an older one, report the exact block that was damaged. */
         for (size_t j = 0; j < i; ++j) {
             uint8_t *q = (uint8_t *)blocks[j];
+            size_t guard = alloc_sizes[j] - HEAP_GUARD_SIZE;
             if (q[0] != (uint8_t)j ||
                 q[sizes[j] - 1] != (uint8_t)(0xFFU - j) ||
-                q[sizes[j]] != HEAP_GUARD_A ||
-                q[sizes[j] + HEAP_GUARD_SIZE - 1] != HEAP_GUARD_A) {
+                q[guard] != HEAP_GUARD_A ||
+                q[guard + HEAP_GUARD_SIZE - 1] != HEAP_GUARD_A) {
                 serial_puts("[SELFTEST][HEAP] FAIL: overwrite at block ");
                 serial_putn(j, 10, 0);
                 serial_puts(" caused by allocation ");
@@ -123,9 +132,10 @@ static int test_heap(void) {
 
     for (size_t i = 0; i < HEAP_TEST_BLOCKS; ++i) {
         uint8_t *p = (uint8_t *)blocks[i];
+        size_t guard = alloc_sizes[i] - HEAP_GUARD_SIZE;
         if (p[0] != (uint8_t)i || p[sizes[i] - 1] != (uint8_t)(0xFFU - i) ||
-            p[sizes[i]] != HEAP_GUARD_A ||
-            p[sizes[i] + HEAP_GUARD_SIZE - 1] != HEAP_GUARD_A) {
+            p[guard] != HEAP_GUARD_A ||
+            p[guard + HEAP_GUARD_SIZE - 1] != HEAP_GUARD_A) {
             serial_puts("[SELFTEST][HEAP] FAIL: data/guard corruption at block ");
             serial_putn(i, 10, 0); serial_puts("\n");
             for (size_t j = 0; j < HEAP_TEST_BLOCKS; ++j) if (blocks[j]) kfree(blocks[j]);
@@ -165,10 +175,7 @@ static int test_heap(void) {
     }
     for (size_t i = HEAP_TEST_BLOCKS; i-- > 0;) kfree(blocks[i]);
 
-    /* HEAP_GUARD_B is deliberately unused above; keep the guard constants
-     * distinct so future tests can alternate patterns without changing ABI. */
     (void)HEAP_GUARD_B;
-
     serial_puts("[SELFTEST][HEAP] 128 fragmented alloc/free cycles: OK\n");
     return 1;
 }
