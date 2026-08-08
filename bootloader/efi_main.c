@@ -101,7 +101,8 @@ static EFI_STATUS map_page_4k(UINT64 *pml4, EFI_PHYSICAL_ADDRESS virt, EFI_PHYSI
 
     if (!(pml4[pml4_idx] & 1)) {
         EFI_PHYSICAL_ADDRESS new_pdpt;
-        uefi_call_wrapper(BS->AllocatePages, 4, AllocateAnyPages, EfiLoaderData, 1, &new_pdpt);
+        EFI_STATUS status = uefi_call_wrapper(BS->AllocatePages, 4, AllocateAnyPages, EfiLoaderData, 1, &new_pdpt);
+        if (EFI_ERROR(status)) return status;
         ZeroMem((VOID*)new_pdpt, 4096);
         pml4[pml4_idx] = new_pdpt | 0x03;
     }
@@ -109,7 +110,8 @@ static EFI_STATUS map_page_4k(UINT64 *pml4, EFI_PHYSICAL_ADDRESS virt, EFI_PHYSI
 
     if (!(pdpt[pdpt_idx] & 1)) {
         EFI_PHYSICAL_ADDRESS new_pd;
-        uefi_call_wrapper(BS->AllocatePages, 4, AllocateAnyPages, EfiLoaderData, 1, &new_pd);
+        EFI_STATUS status = uefi_call_wrapper(BS->AllocatePages, 4, AllocateAnyPages, EfiLoaderData, 1, &new_pd);
+        if (EFI_ERROR(status)) return status;
         ZeroMem((VOID*)new_pd, 4096);
         pdpt[pdpt_idx] = new_pd | 0x03;
     }
@@ -117,7 +119,8 @@ static EFI_STATUS map_page_4k(UINT64 *pml4, EFI_PHYSICAL_ADDRESS virt, EFI_PHYSI
 
     if (!(pd[pd_idx] & 1)) {
         EFI_PHYSICAL_ADDRESS new_pt;
-        uefi_call_wrapper(BS->AllocatePages, 4, AllocateAnyPages, EfiLoaderData, 1, &new_pt);
+        EFI_STATUS status = uefi_call_wrapper(BS->AllocatePages, 4, EfiLoaderData, 1, &new_pt);
+        if (EFI_ERROR(status)) return status;
         ZeroMem((VOID*)new_pt, 4096);
         pd[pd_idx] = new_pt | 0x03;
     }
@@ -157,6 +160,62 @@ static EFI_STATUS load_kernel(EFI_FILE *root, VOID **entry_point, UINT64 *pml4) 
         goto cleanup;
     }
 
+    // Los PT_LOAD pueden compartir una misma pagina virtual. Esto ocurre en
+    // AuraOS porque un segmento empieza en 0x...0030 y otro en la pagina
+    // 0x...0000. El loader anterior asignaba una pagina fisica distinta a
+    // cada segmento y el ultimo PT_LOAD sobrescribia el PTE del primero.
+    // Resultado: el entry point acababa ejecutando bytes de otro segmento.
+    // Cargamos todo el rango virtual del kernel en un unico bloque fisico.
+    UINT64 image_min = UINT64_MAX;
+    UINT64 image_max = 0;
+    UINTN load_count = 0;
+
+    for (UINTN i = 0; i < ehdr.e_phnum; i++) {
+        struct Elf64_Phdr phdr;
+        UINTN phdr_size = sizeof(phdr);
+        status = uefi_call_wrapper(file->SetPosition, 2, file, ehdr.e_phoff + i * ehdr.e_phentsize);
+        if (EFI_ERROR(status)) goto cleanup;
+        status = uefi_call_wrapper(file->Read, 3, file, &phdr_size, &phdr);
+        if (EFI_ERROR(status) || phdr_size != sizeof(phdr)) goto cleanup;
+        if (phdr.p_type != PT_LOAD || phdr.p_memsz == 0) continue;
+
+        UINT64 seg_start = phdr.p_vaddr & ~0xFFFULL;
+        UINT64 seg_end = phdr.p_vaddr + phdr.p_memsz;
+        if (seg_end < phdr.p_vaddr) {
+            status = EFI_LOAD_ERROR;
+            goto cleanup;
+        }
+        seg_end = (seg_end + 0xFFFULL) & ~0xFFFULL;
+        if (seg_end < seg_start) {
+            status = EFI_LOAD_ERROR;
+            goto cleanup;
+        }
+        if (seg_start < image_min) image_min = seg_start;
+        if (seg_end > image_max) image_max = seg_end;
+        load_count++;
+    }
+
+    if (load_count == 0 || image_max <= image_min) {
+        Print(L"[BOOT] No hay segmentos PT_LOAD validos\n");
+        status = EFI_LOAD_ERROR;
+        goto cleanup;
+    }
+
+    UINT64 image_size = image_max - image_min;
+    UINTN image_pages = (UINTN)(image_size / 0x1000ULL);
+    EFI_PHYSICAL_ADDRESS image_phys = 0;
+
+    status = uefi_call_wrapper(BS->AllocatePages, 4, AllocateAnyPages, EfiLoaderData,
+                               image_pages, &image_phys);
+    if (EFI_ERROR(status)) {
+        Print(L"[BOOT] No se pudo reservar la imagen del kernel (%d paginas)\n", image_pages);
+        goto cleanup;
+    }
+    ZeroMem((VOID*)image_phys, image_size);
+
+    Print(L"[BOOT] Kernel image: vaddr=0x%lx size=0x%lx paddr=0x%lx pages=%d\n",
+          image_min, image_size, image_phys, image_pages);
+
     EFI_PHYSICAL_ADDRESS entry_phys = 0;
 
     for (UINTN i = 0; i < ehdr.e_phnum; i++) {
@@ -165,65 +224,51 @@ static EFI_STATUS load_kernel(EFI_FILE *root, VOID **entry_point, UINT64 *pml4) 
         status = uefi_call_wrapper(file->SetPosition, 2, file, ehdr.e_phoff + i * ehdr.e_phentsize);
         if (EFI_ERROR(status)) goto cleanup;
         status = uefi_call_wrapper(file->Read, 3, file, &phdr_size, &phdr);
-        if (EFI_ERROR(status)) goto cleanup;
+        if (EFI_ERROR(status) || phdr_size != sizeof(phdr)) goto cleanup;
+        if (phdr.p_type != PT_LOAD || phdr.p_memsz == 0) continue;
 
-        if (phdr.p_type != PT_LOAD) continue;
-
-        EFI_PHYSICAL_ADDRESS paddr = phdr.p_paddr;
-        if (paddr == 0) {
-            status = uefi_call_wrapper(BS->AllocatePages, 4, AllocateAnyPages, EfiLoaderData,
-                                        (phdr.p_memsz + 0xFFF) / 0x1000, &paddr);
-        } else {
-            UINTN num_pages = (phdr.p_memsz + 0xFFF) / 0x1000;
-            if (num_pages == 0) num_pages = 1;
-            status = uefi_call_wrapper(BS->AllocatePages, 4, AllocateAddress, EfiLoaderData,
-                                        num_pages, &paddr);
-            if (EFI_ERROR(status)) {
-                status = uefi_call_wrapper(BS->AllocatePages, 4, AllocateAnyPages, EfiLoaderData,
-                                            num_pages, &paddr);
-            }
-        }
-        if (EFI_ERROR(status)) {
-            Print(L"[BOOT] Fallo alocando memoria para segmento %d\n", i);
-            goto cleanup;
-        }
+        UINT64 offset = phdr.p_vaddr - image_min;
+        EFI_PHYSICAL_ADDRESS paddr = image_phys + offset;
 
         status = uefi_call_wrapper(file->SetPosition, 2, file, phdr.p_offset);
         if (EFI_ERROR(status)) goto cleanup;
-        UINTN read_size = phdr.p_filesz;
+        UINTN read_size = (UINTN)phdr.p_filesz;
         status = uefi_call_wrapper(file->Read, 3, file, &read_size, (VOID*)paddr);
-        if (EFI_ERROR(status)) goto cleanup;
+        if (EFI_ERROR(status) || read_size != (UINTN)phdr.p_filesz) goto cleanup;
 
         if (phdr.p_memsz > phdr.p_filesz) {
             ZeroMem((VOID*)(paddr + phdr.p_filesz), phdr.p_memsz - phdr.p_filesz);
         }
 
-        UINTN num_pages = (phdr.p_memsz + 0xFFF) / 0x1000;
-        for (UINTN p = 0; p < num_pages; p++) {
-            map_page_4k(pml4, phdr.p_vaddr + p * 0x1000, paddr + p * 0x1000);
+        UINT64 map_start = phdr.p_vaddr & ~0xFFFULL;
+        UINT64 map_end = (phdr.p_vaddr + phdr.p_memsz + 0xFFFULL) & ~0xFFFULL;
+        for (UINT64 v = map_start; v < map_end; v += 0x1000ULL) {
+            EFI_PHYSICAL_ADDRESS page_phys = image_phys + (v - image_min);
+            status = map_page_4k(pml4, v, page_phys);
+            if (EFI_ERROR(status)) goto cleanup;
         }
 
         if (ehdr.e_entry >= phdr.p_vaddr && ehdr.e_entry < phdr.p_vaddr + phdr.p_filesz) {
-            entry_phys = paddr + (ehdr.e_entry - phdr.p_vaddr);
+            entry_phys = image_phys + (ehdr.e_entry - image_min);
         }
 
         Print(L"[BOOT] Segmento %d: vaddr=0x%lx paddr=0x%lx pages=%d\n",
-              i, phdr.p_vaddr, paddr, num_pages);
+              i, phdr.p_vaddr, paddr, (UINTN)((map_end - map_start) / 0x1000ULL));
+    }
+
+    if (entry_phys == 0) {
+        Print(L"[BOOT] ERROR: Entry point no pertenece a ningun PT_LOAD\n");
+        status = EFI_LOAD_ERROR;
+        goto cleanup;
     }
 
     *entry_point = (VOID*)ehdr.e_entry;
     Print(L"[BOOT] Entry point: 0x%lx\n", ehdr.e_entry);
-
-    if (entry_phys != 0) {
-        UINT8 *bytes = (UINT8*)entry_phys;
-        Print(L"[BOOT] Entry physical: 0x%lx bytes:", entry_phys);
-        for (UINTN i = 0; i < 32; i++) {
-            Print(L" %02x", bytes[i]);
-        }
-        Print(L"\n");
-    } else {
-        Print(L"[BOOT] ERROR: Entry point no pertenece a ningun PT_LOAD\n");
+    Print(L"[BOOT] Entry physical: 0x%lx bytes:", entry_phys);
+    for (UINTN i = 0; i < 32; i++) {
+        Print(L" %02x", ((UINT8*)entry_phys)[i]);
     }
+    Print(L"\n");
 
     status = EFI_SUCCESS;
 
@@ -259,134 +304,121 @@ static EFI_STATUS build_page_tables(EFI_PHYSICAL_ADDRESS *pml4_out) {
     status = uefi_call_wrapper(BS->AllocatePages, 4, AllocateAnyPages, EfiLoaderData, 1, &pdpt_addr);
     if (EFI_ERROR(status)) return status;
 
+    ZeroMem((VOID*)pml4_addr, 4096);
+    ZeroMem((VOID*)pdpt_addr, 4096);
+    UINT64 *pml4 = (UINT64*)pml4_addr;
+    UINT64 *pdpt = (UINT64*)pdpt_addr;
+    pml4[0] = pdpt_addr | 0x03;
+
     for (int i = 0; i < 4; i++) {
         status = uefi_call_wrapper(BS->AllocatePages, 4, AllocateAnyPages, EfiLoaderData, 1, &pd_addrs[i]);
         if (EFI_ERROR(status)) return status;
-    }
-
-    UINT64 *pml4 = (UINT64*)pml4_addr;
-    UINT64 *pdpt = (UINT64*)pdpt_addr;
-
-    ZeroMem(pml4, 4096);
-    ZeroMem(pdpt, 4096);
-    for (int i = 0; i < 4; i++) ZeroMem((VOID*)pd_addrs[i], 4096);
-
-    pml4[0] = pdpt_addr | 0x03;
-    for (int pd_idx = 0; pd_idx < 4; pd_idx++) {
-        pdpt[pd_idx] = pd_addrs[pd_idx] | 0x03;
-        UINT64 *pd = (UINT64*)pd_addrs[pd_idx];
-        for (int pt_idx = 0; pt_idx < 512; pt_idx++) {
-            uint64_t phys = (uint64_t)pd_idx * 0x40000000 + pt_idx * 0x200000;
-            pd[pt_idx] = phys | 0x83;
+        ZeroMem((VOID*)pd_addrs[i], 4096);
+        pdpt[i] = pd_addrs[i] | 0x03;
+        UINT64 *pd = (UINT64*)pd_addrs[i];
+        for (int j = 0; j < 512; j++) {
+            UINT64 phys = ((UINT64)i * 512 + j) * 0x200000ULL;
+            pd[j] = phys | 0x83;
         }
     }
+
+    // Higher half: 0xFFFFFFFF80000000 -> PML4[511], PDPT[510].
+    pml4[511] = pdpt_addr | 0x03;
 
     *pml4_out = pml4_addr;
     return EFI_SUCCESS;
 }
 
-static void jump_to_kernel(VOID *kernel_entry, EFI_HANDLE image_handle, struct kernel_boot_info *kinfo, EFI_PHYSICAL_ADDRESS pml4_addr) {
-    EFI_STATUS status;
-
-    EFI_PHYSICAL_ADDRESS safe_memmap_addr = 0;
-    status = uefi_call_wrapper(BS->AllocatePages, 4, AllocateAnyPages, EfiLoaderData,
-                                (mem_map.map_size + 0xFFF) / 0x1000, &safe_memmap_addr);
-    if (EFI_ERROR(status)) {
-        Print(L"[BOOT] Fallo alocando buffer seguro para memmap\n");
-        return;
-    }
-    CopyMem((VOID*)safe_memmap_addr, mem_map.map, mem_map.map_size);
-    kinfo->memmap = safe_memmap_addr;
-
-    Print(L"[BOOT] Tablas de pagina listas. Memmap copiado.\n");
-    Print(L"[BOOT] Saltando al kernel...\n");
-
-    __asm__ volatile ("cli");
-
-    status = uefi_call_wrapper(BS->ExitBootServices, 2, image_handle, mem_map.map_key);
-    if (EFI_ERROR(status)) {
-        get_memory_map(image_handle);
-        CopyMem((VOID*)safe_memmap_addr, mem_map.map, mem_map.map_size);
-        kinfo->memmap = safe_memmap_addr;
-        status = uefi_call_wrapper(BS->ExitBootServices, 2, image_handle, mem_map.map_key);
-        if (EFI_ERROR(status)) {
-            while (1) __asm__ volatile ("hlt");
-        }
-    }
-
-    __asm__ volatile ("movq %0, %%cr3" : : "r"(pml4_addr) : "memory");
-
-    typedef void (*kernel_fn_t)(struct kernel_boot_info*);
-    kernel_fn_t kmain = (kernel_fn_t)kernel_entry;
-
-    kmain(kinfo);
-
-    while (1) __asm__ volatile ("hlt");
+static EFI_STATUS copy_memory_map(VOID **map_out, UINTN *map_size_out, UINTN *desc_size_out, UINT32 *desc_ver_out) {
+    UINTN size = mem_map.map_size;
+    EFI_STATUS status = uefi_call_wrapper(BS->AllocatePool, 3, EfiLoaderData, size, map_out);
+    if (EFI_ERROR(status)) return status;
+    CopyMem(*map_out, mem_map.map, size);
+    *map_size_out = size;
+    *desc_size_out = mem_map.desc_size;
+    *desc_ver_out = mem_map.desc_version;
+    return EFI_SUCCESS;
 }
 
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *system_table) {
     InitializeLib(image_handle, system_table);
     Print(L"\n=== AURORA OS BOOTLOADER ===\n");
-    Print(L"[BOOT] Cargando kernel...\n");
 
-    EFI_STATUS status = uefi_call_wrapper(BS->OpenProtocol, 6, image_handle, &LoadedImageProtocol,
-                                           (VOID**)&loaded_image, image_handle, NULL, EFI_OPEN_PROTOCOL_GET_PROTOCOL);
+    EFI_STATUS status;
+    status = uefi_call_wrapper(BS->HandleProtocol, 3, image_handle, &LoadedImageProtocol,
+                               (VOID**)&loaded_image);
+    if (EFI_ERROR(status)) return status;
+
+    status = uefi_call_wrapper(BS->HandleProtocol, 3, loaded_image->DeviceHandle,
+                               &FileSystemProtocol, (VOID**)&fs);
+    if (EFI_ERROR(status)) return status;
+
     EFI_FILE *root = NULL;
-    if (EFI_ERROR(status)) {
-        Print(L"[BOOT] Error LoadedImageProtocol\n");
-        return status;
-    }
-
-    status = uefi_call_wrapper(BS->OpenProtocol, 6, loaded_image->DeviceHandle,
-                                &gEfiSimpleFileSystemProtocolGuid, (VOID**)&fs,
-                                image_handle, NULL, EFI_OPEN_PROTOCOL_GET_PROTOCOL);
-    if (EFI_ERROR(status)) {
-        Print(L"[BOOT] Error SimpleFileSystemProtocol\n");
-        return status;
-    }
-
     status = uefi_call_wrapper(fs->OpenVolume, 2, fs, &root);
-    if (EFI_ERROR(status)) {
-        Print(L"[BOOT] Error abriendo volumen raiz\n");
-        return status;
-    }
+    if (EFI_ERROR(status)) return status;
 
     setup_framebuffer();
 
     EFI_PHYSICAL_ADDRESS pml4_addr = 0;
     status = build_page_tables(&pml4_addr);
     if (EFI_ERROR(status)) {
-        Print(L"[BOOT] Fallo construyendo tablas de pagina\n");
+        Print(L"[BOOT] Error construyendo tablas de pagina: %r\n", status);
         return status;
     }
 
-    VOID *kernel_entry = NULL;
-    status = load_kernel(root, &kernel_entry, (UINT64*)pml4_addr);
+    VOID *entry_point = NULL;
+    status = load_kernel(root, &entry_point, (UINT64*)pml4_addr);
+    if (EFI_ERROR(status)) return status;
+
+    VOID *map_copy = NULL;
+    UINTN map_size = 0, desc_size = 0;
+    UINT32 desc_ver = 0;
+    status = copy_memory_map(&map_copy, &map_size, &desc_size, &desc_ver);
     if (EFI_ERROR(status)) {
-        Print(L"[BOOT] Fallo al cargar kernel\n");
+        Print(L"[BOOT] Error copiando memmap: %r\n", status);
         return status;
     }
 
-    status = get_memory_map(image_handle);
+    struct kernel_boot_info *boot_info = NULL;
+    status = uefi_call_wrapper(BS->AllocatePool, 3, EfiLoaderData, sizeof(*boot_info), (VOID**)&boot_info);
+    if (EFI_ERROR(status)) return status;
+
+    boot_info->fb_base = gop ? gop->Mode->FrameBufferBase : 0;
+    boot_info->fb_size = gop ? gop->Mode->FrameBufferSize : 0;
+    boot_info->fb_width = gop ? gop->Mode->Info->HorizontalResolution : 0;
+    boot_info->fb_height = gop ? gop->Mode->Info->VerticalResolution : 0;
+    boot_info->fb_pitch = gop ? gop->Mode->Info->PixelsPerScanLine * 4 : 0;
+    boot_info->fb_bpp = 32;
+    boot_info->memmap = (uint64_t)map_copy;
+    boot_info->memmap_size = map_size;
+    boot_info->memmap_desc_size = desc_size;
+    boot_info->memmap_desc_ver = desc_ver;
+
+    UINT8 *stack = NULL;
+    status = uefi_call_wrapper(BS->AllocatePool, 3, EfiLoaderData, 16384, (VOID**)&stack);
+    if (EFI_ERROR(status)) return status;
+    UINT64 stack_top = ((UINT64)stack + 16384) & ~0xFULL;
+
+    // Map the framebuffer into the identity map if it lies outside the initial
+    // 2 GiB identity range. The current QEMU framebuffer is at 0x80000000,
+    // which is already covered by the 4 x 1 GiB identity mappings above.
+
+    status = uefi_call_wrapper(BS->ExitBootServices, 2, image_handle, mem_map.map_key);
     if (EFI_ERROR(status)) {
-        Print(L"[BOOT] Fallo obteniendo memmap\n");
+        Print(L"[BOOT] ExitBootServices fallo: %r\n", status);
         return status;
     }
 
-    struct kernel_boot_info kinfo = {0};
-    if (gop) {
-        kinfo.fb_base   = gop->Mode->FrameBufferBase;
-        kinfo.fb_size   = gop->Mode->FrameBufferSize;
-        kinfo.fb_width  = gop->Mode->Info->HorizontalResolution;
-        kinfo.fb_height = gop->Mode->Info->VerticalResolution;
-        kinfo.fb_pitch  = gop->Mode->Info->PixelsPerScanLine * 4;
-        kinfo.fb_bpp    = 32;
-    }
-    kinfo.memmap_size      = mem_map.map_size;
-    kinfo.memmap_desc_size = mem_map.desc_size;
-    kinfo.memmap_desc_ver  = mem_map.desc_version;
+    __asm__ volatile("mov %0, %%cr3" : : "r"((UINT64)pml4_addr) : "memory");
+    __asm__ volatile("mov %0, %%rsp" : : "r"(stack_top) : "memory");
 
-    jump_to_kernel(kernel_entry, image_handle, &kinfo, pml4_addr);
+    typedef void (*kernel_entry_t)(struct kernel_boot_info*);
+    kernel_entry_t entry = (kernel_entry_t)entry_point;
 
-    while (1) __asm__ volatile ("hlt");
+    Print(L"[BOOT] Tablas de pagina listas. Memmap copiado.\n");
+    Print(L"[BOOT] Saltando al kernel...\n");
+
+    entry(boot_info);
+
+    return EFI_SUCCESS;
 }
