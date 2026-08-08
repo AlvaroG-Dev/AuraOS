@@ -47,11 +47,11 @@ task_t *sched_create_task(void (*fn)(void)) {
   }
 
   /* task_switch pops r15..rbx, then RETs to task_trampoline.
-   * After RET, task_trampoline executes CALL task_entry_wrapper.
-   * System V AMD64 requires RSP % 16 == 8 immediately before CALL.
-   * Therefore the synthetic stack's post-RET RSP must be 8 mod 16. */
+   * The RET leaves RSP 16-byte aligned. The subsequent CALL pushes
+   * its return address, so task_entry_wrapper enters with RSP % 16 == 8,
+   * exactly as required by the System V AMD64 ABI. */
   uint64_t stack_top = (uint64_t)(stack + TASK_STACK_SIZE);
-  stack_top = (stack_top & ~0xFULL) - 8;
+  stack_top &= ~0xFULL;
   uint64_t *sp = (uint64_t *)stack_top;
 
   *(--sp) = (uint64_t)task_trampoline; /* RET target */
