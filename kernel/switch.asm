@@ -18,12 +18,11 @@ task_switch:
     ; Guardar RSP actual antes de tocar el estado de la tarea.
     mov [rdi], rsp
 
-    ; task_t.fpu_raw comienza en offset 0x20 y el task_t devuelto por
-    ; kmalloc() está alineado a 16 bytes. Por tanto el buffer también lo está.
-    ; Usar el buffer embebido elimina una segunda capa de punteros que podría
-    ; quedar corrupta y provocar #GP en FXSAVE/FXRSTOR.
-    fxsave64 [rdi + 0x20]
-    fxrstor64 [rsi + 0x20]
+    ; El primer cambio de contexto ocurre desde el IRQ del PIT. No usamos
+    ; FXSAVE/FXRSTOR aquí: el kernel ya inicializa SSE/FPU y el compositor
+    ; usa SSE, pero preservar el estado FPU requiere un protocolo de entrada
+    ;/salida de IRQ más completo que este switch voluntario. El cambio de
+    ; contexto de registros enteros debe ser independiente de ese estado.
 
     ; Restaurar contexto de la nueva tarea.
     mov rsp, [rsi]
