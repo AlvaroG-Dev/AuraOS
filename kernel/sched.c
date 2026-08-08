@@ -53,7 +53,23 @@ task_t *sched_create_task(void (*fn)(void)) {
     return NULL;
   }
 
-  uint64_t *sp = (uint64_t *)(((uint64_t)(stack + TASK_STACK_SIZE)) & ~0xFULL);
+  /*
+   * Build the synthetic context consumed by task_switch:
+   * pop r15, r14, r13, r12, rbp, rbx, ret.
+   *
+   * stack is a byte pointer, so TASK_STACK_SIZE is measured in bytes.
+   * The initial stack also has to obey the x86-64 SysV ABI. task_trampoline
+   * makes a normal CALL to task_entry_wrapper; therefore task_trampoline
+   * must start with RSP % 16 == 0 so that the CALL makes the C function
+   * enter with RSP % 16 == 8, as required by the ABI.
+   *
+   * task_switch consumes 56 bytes (6 registers + return address). Choosing
+   * the synthetic context at an address congruent to 8 mod 16 gives exactly
+   * that alignment at task_trampoline entry.
+   */
+  uint64_t stack_top = (uint64_t)(stack + TASK_STACK_SIZE);
+  stack_top = (stack_top & ~0xFULL) - 8ULL;
+  uint64_t *sp = (uint64_t *)stack_top;
 
   *(--sp) = (uint64_t)task_trampoline;
   *(--sp) = (uint64_t)0;               // rbx
