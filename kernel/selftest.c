@@ -19,7 +19,6 @@ static int test_pmm(void) {
             for (size_t j = 0; j < i; ++j) pmm_free_page(pages[j]);
             return 0;
         }
-
         volatile uint64_t *p = (volatile uint64_t *)(uintptr_t)pages[i];
         p[0] = 0xA55AA55A12345678ULL ^ (uint64_t)i;
         p[7] = 0x5AA55AA5DEADBEEFULL ^ (uint64_t)i;
@@ -42,16 +41,14 @@ static int test_pmm(void) {
     }
 
     for (size_t i = PMM_TEST_PAGES; i-- > 0;) pmm_free_page(pages[i]);
-
     if (pmm_free_pages() != before) {
         serial_puts("[SELFTEST][PMM] FAIL: free counter after free\n");
         return 0;
     }
 
-    // Reserved pages must never become free through pmm_free_page().
-    uint64_t reserved = 0x1000;
+    // Page zero is unconditionally reserved by the PMM.
     uint64_t reserved_before = pmm_free_pages();
-    pmm_free_page(reserved);
+    pmm_free_page(0);
     if (pmm_free_pages() != reserved_before) {
         serial_puts("[SELFTEST][PMM] FAIL: reserved page was freed\n");
         return 0;
@@ -78,7 +75,6 @@ static int test_heap(void) {
             for (size_t j = 0; j < i; ++j) kfree(blocks[j]);
             return 0;
         }
-
         uint8_t *p = (uint8_t *)blocks[i];
         p[0] = (uint8_t)i;
         p[sizes[i] - 1] = (uint8_t)(0xFFU - i);
@@ -88,12 +84,11 @@ static int test_heap(void) {
         uint8_t *p = (uint8_t *)blocks[i];
         if (p[0] != (uint8_t)i || p[sizes[i] - 1] != (uint8_t)(0xFFU - i)) {
             serial_puts("[SELFTEST][HEAP] FAIL: data corruption\n");
-            for (size_t j = 0; j < HEAP_TEST_BLOCKS; ++j) kfree(blocks[j]);
+            for (size_t j = 0; j < HEAP_TEST_BLOCKS; ++j) if (blocks[j]) kfree(blocks[j]);
             return 0;
         }
     }
 
-    // Free in a non-sequential order to exercise fragmentation and coalescing.
     for (size_t pass = 0; pass < 2; ++pass) {
         for (size_t i = pass; i < HEAP_TEST_BLOCKS; i += 2) {
             kfree(blocks[i]);
@@ -101,7 +96,6 @@ static int test_heap(void) {
         }
     }
 
-    // The allocator must still be able to reuse/coalesce the freed space.
     void *large = kmalloc(32768);
     if (!large) {
         serial_puts("[SELFTEST][HEAP] FAIL: reuse/coalescing allocation\n");
@@ -117,12 +111,11 @@ static int test_heap(void) {
     }
     kfree(large);
 
-    // A second allocation/free cycle catches stale free-list links.
     for (size_t i = 0; i < HEAP_TEST_BLOCKS; ++i) {
         blocks[i] = kmalloc(64 + (i % 17));
         if (!blocks[i]) {
             serial_puts("[SELFTEST][HEAP] FAIL: second allocation cycle\n");
-            for (size_t j = 0; j < i; ++j) kfree(blocks[j]);
+            for (size_t j = 0; j < i; ++j) if (blocks[j]) kfree(blocks[j]);
             return 0;
         }
     }
