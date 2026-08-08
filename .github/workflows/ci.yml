@@ -28,15 +28,12 @@ jobs:
       - name: Prepare OVMF
         run: |
           set -euo pipefail
-
           CODE_SRC="$(find /usr/share /usr/lib -type f \( -name 'OVMF_CODE.fd' -o -name 'OVMF_CODE_4M.fd' \) -print -quit)"
           if [ -z "$CODE_SRC" ]; then
             echo "ERROR: OVMF_CODE.fd no encontrado tras instalar ovmf"
             exit 1
           fi
-
           cp "$CODE_SRC" OVMF_CODE.fd
-
           if [ ! -f OVMF_VARS.fd ]; then
             VARS_SRC="$(find /usr/share /usr/lib -type f \( -name 'OVMF_VARS.fd' -o -name 'OVMF_VARS_4M.fd' \) -print -quit)"
             if [ -z "$VARS_SRC" ]; then
@@ -45,17 +42,16 @@ jobs:
             fi
             cp "$VARS_SRC" OVMF_VARS.fd
           fi
-
           ls -lh OVMF_CODE.fd OVMF_VARS.fd
 
       - name: Build AuraOS
         run: make clean && make
 
-      - name: Boot smoke test in QEMU
+      - name: Boot and memory stress test in QEMU
         run: |
           set -o pipefail
           set +e
-          timeout --signal=TERM 15s make run 2>&1 | tee qemu.log
+          timeout --signal=TERM 20s make run 2>&1 | tee qemu.log
           status=${PIPESTATUS[0]}
           set -e
 
@@ -65,7 +61,22 @@ jobs:
             exit 1
           fi
 
+          # Boot invariants.
           grep -Fq "[PMM] Bitmap" qemu.log
           grep -Fq "[HEAP] Heap inicializado" qemu.log
           grep -Fq "[INIT] Iniciando Scheduler" qemu.log
-          echo "AuraOS boot smoke test: OK"
+          grep -Fq "[INIT] Aurora OS listo. Multitarea activa." qemu.log
+
+          # Memory self-tests are mandatory: a missing or failed test fails CI.
+          grep -Fq "[SELFTEST][PMM] 256 alloc/write/verify/free: OK" qemu.log
+          grep -Fq "[SELFTEST][HEAP] 128 fragmented alloc/free cycles: OK" qemu.log
+          grep -Fq "[SELFTEST] Todos los tests de memoria: OK" qemu.log
+
+          # No explicit memory/self-test failure may be present.
+          if grep -Eq '\[SELFTEST\].*(FAIL|FALLO)|\[PMM\] ERROR|\[HEAP\] (ERROR|CORRUPCION)' qemu.log; then
+            echo "Memory integrity failure detected"
+            cat qemu.log
+            exit 1
+          fi
+
+          echo "AuraOS boot + memory stress test: OK"
