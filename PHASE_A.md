@@ -14,14 +14,12 @@ This branch hardens the kernel foundation before user mode/process isolation.
 - Heap blocks have magic validation, exact-pointer validation and double-free detection.
 - Added a GitHub Actions build + QEMU boot smoke test.
 
-## Required CI checks
+## Validation
 
-1. Build the UEFI image with the repository Makefiles.
-2. Boot the generated image under QEMU/OVMF.
-3. Verify PMM, heap and scheduler initialization reaches the serial console.
+The branch is intentionally kept separate from `main`. CI must compile the full UEFI image and boot it under QEMU/OVMF before this work is considered ready to merge.
 
-## Next Phase-A work
+## Remaining Phase-A items
 
-- Add a full kernel panic/diagnostic path with register + CR2 reporting.
+- Wire the kernel panic module into the kernel build and exception path after the CI baseline is green.
 - Add focused allocator/VMM tests that can run without a graphical session.
 - Add stricter build warnings and reproducible toolchain checks.
