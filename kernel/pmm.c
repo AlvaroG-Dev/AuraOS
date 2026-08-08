@@ -5,7 +5,7 @@
 extern uint8_t _kernel_start;
 extern uint8_t _kernel_end;
 
-static uint8_t *bitmap = NULL;
+static uint8_t *bitmap = 0;
 static uint64_t bitmap_size = 0;
 static uint64_t max_blocks = 0;
 static uint64_t used_blocks = 0;
@@ -54,7 +54,7 @@ static void reserve_range(uint64_t start, uint64_t end) {
 }
 
 int pmm_init(uint64_t memmap, uint64_t memmap_size, uint64_t memmap_desc_size) {
-    bitmap = NULL;
+    bitmap = 0;
     bitmap_size = 0;
     max_blocks = 0;
     used_blocks = 0;
@@ -69,10 +69,11 @@ int pmm_init(uint64_t memmap, uint64_t memmap_size, uint64_t memmap_desc_size) {
     uint8_t *ptr = (uint8_t *)memmap;
     uint64_t max_phys_addr = 0;
 
-    // Encontrar la direccion fisica maxima con comprobacion de overflow.
     for (uint64_t offset = 0; offset + memmap_desc_size <= memmap_size; offset += memmap_desc_size) {
+        uint32_t type = *(uint32_t *)(ptr + offset);
         uint64_t phys = *(uint64_t *)(ptr + offset + 8);
         uint64_t pages = *(uint64_t *)(ptr + offset + 24);
+        (void)type;
         if (pages > UINT64_MAX / PAGE_SIZE) continue;
 
         uint64_t length = pages * PAGE_SIZE;
@@ -86,12 +87,12 @@ int pmm_init(uint64_t memmap, uint64_t memmap_size, uint64_t memmap_desc_size) {
         return -1;
     }
 
-    max_blocks = (max_phys_addr + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint64_t rounded_max = max_phys_addr - 1;
+    if (rounded_max > UINT64_MAX - PAGE_SIZE) return -1;
+    max_blocks = (rounded_max + PAGE_SIZE) / PAGE_SIZE;
     if (max_blocks > UINT64_MAX - 7) return -1;
     bitmap_size = (max_blocks + 7) / 8;
 
-    // El PMM inicial todavia usa el identity-map proporcionado por UEFI para
-    // acceder al bitmap. Por eso exigimos que el bitmap completo este <4 GiB.
     uint64_t bitmap_phys = 0;
     for (uint64_t offset = 0; offset + memmap_desc_size <= memmap_size; offset += memmap_desc_size) {
         uint32_t type = *(uint32_t *)(ptr + offset);
@@ -120,7 +121,6 @@ int pmm_init(uint64_t memmap, uint64_t memmap_size, uint64_t memmap_desc_size) {
     for (uint64_t i = 0; i < bitmap_size; i++) bitmap[i] = 0xFF;
     used_blocks = max_blocks;
 
-    // Solo las regiones EFI_CONVENTIONAL se liberan inicialmente.
     for (uint64_t offset = 0; offset + memmap_desc_size <= memmap_size; offset += memmap_desc_size) {
         uint32_t type = *(uint32_t *)(ptr + offset);
         uint64_t phys = *(uint64_t *)(ptr + offset + 8);
@@ -139,18 +139,14 @@ int pmm_init(uint64_t memmap, uint64_t memmap_size, uint64_t memmap_desc_size) {
         }
     }
 
-    // Reservas obligatorias independientemente de como UEFI etiquete la region.
     reserve_page(0);
 
-    // Reservar explicitamente el kernel fisico. El linker define la VMA y AT()
-    // hace que la imagen se cargue en VMA-KERNEL_VMA.
     uint64_t kernel_start = (uint64_t)&_kernel_start;
     uint64_t kernel_end = (uint64_t)&_kernel_end;
     if (kernel_start >= KERNEL_VMA && kernel_end > kernel_start) {
         reserve_range(kernel_start - KERNEL_VMA, kernel_end - KERNEL_VMA);
     }
 
-    // Reservar el propio bitmap.
     uint64_t bitmap_end;
     if (!range_end(bitmap_phys, bitmap_size, &bitmap_end)) return -1;
     reserve_range(bitmap_phys, bitmap_end);
