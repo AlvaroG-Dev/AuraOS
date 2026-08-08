@@ -5,7 +5,9 @@
 ;   rdi = old_task
 ;   rsi = new_task
 ;
-; Guardamos/restauramos los registros CALLEE-SAVED y el estado FPU/SSE.
+; Solo guardamos/restauramos los registros CALLEE-SAVED (ABI System V x86-64):
+;   rbx, rbp, r12, r13, r14, r15
+; El compilador ya se encargo de guardar los caller-saved antes de llamarnos.
 
 section .text
 bits 64
@@ -13,10 +15,7 @@ bits 64
 global task_switch
 
 task_switch:
-    ; El cambio de contexto se ejecuta con IRQs deshabilitadas.
-    cli
-
-    ; Guardar registros callee-saved de la tarea actual.
+    ; --- Guardar contexto de la tarea vieja (old_task = rdi) ---
     push rbx
     push rbp
     push r12
@@ -24,18 +23,19 @@ task_switch:
     push r14
     push r15
 
-    ; Guardar RSP actual antes de cambiar al estado de la nueva tarea.
+    ; Guardar el RSP actual en old_task->rsp (offset 0 del struct)
     mov [rdi], rsp
 
-    ; Guardar el estado FPU/SSE de la tarea actual.
+    ; 2. Cargar el puntero FPU alineado (offset 24 / 0x18) y guardar estado
     mov rax, [rdi + 24]
     fxsave64 [rax]
 
-    ; Restaurar el estado FPU/SSE de la nueva tarea.
+    ; 3. Cargar el puntero FPU alineado de la nueva tarea y restaurar estado
     mov rax, [rsi + 24]
     fxrstor64 [rax]
 
-    ; Restaurar contexto de la nueva tarea.
+    ; --- Restaurar contexto de la tarea nueva (new_task = rsi) ---
+    ; Cargar RSP desde new_task->rsp
     mov rsp, [rsi]
 
     pop r15
@@ -44,6 +44,8 @@ task_switch:
     pop r12
     pop rbp
     pop rbx
+
+    ; El 'ret' salta a donde new_task se quedó la última vez
     ret
 
 ; Punto de entrada inicial de una tarea nueva.
@@ -51,12 +53,9 @@ global task_trampoline
 extern task_entry_wrapper
 
 task_trampoline:
-    ; Una tarea nueva llega aquí con IF=0. El wrapper habilita IRQs cuando
-    ; el contexto C ya está establecido.
-    cld
+    sti
     mov rdi, r12
     call task_entry_wrapper
 .hang:
-    cli
     hlt
     jmp .hang
