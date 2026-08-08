@@ -1,4 +1,7 @@
-# Makefile global - Aurora OS
+# Makefile global - AuraOS
+
+OVMF_CODE ?= OVMF_CODE.fd
+OVMF_VARS ?= OVMF_VARS.fd
 
 .PHONY: all bootloader kernel image run run-debug clean sysroot
 
@@ -8,7 +11,7 @@ sysroot:
 	@# 1. Crear la estructura base en sysroot
 	@mkdir -p sysroot/system/icons sysroot/system/wallpapers
 	@if [ ! -f sysroot/system/config.txt ]; then \
-		echo "Aurora OS v0.1.0 Initramfs Config" > sysroot/system/config.txt; \
+		echo "AuraOS v0.1.0 Initramfs Config" > sysroot/system/config.txt; \
 	fi
 	@# 2. Copiar assets persistentes (icons, wallpapers, etc.) a sysroot si existe la carpeta
 	@if [ -d assets ]; then \
@@ -34,10 +37,11 @@ image: bootloader kernel
 	mcopy -i aurora.img -s esp/kernel.elf ::
 
 run: image
-	@test -f OVMF_VARS.fd || cp /usr/share/OVMF/OVMF_VARS.fd . 2>/dev/null || echo "WARNING: OVMF_VARS.fd no encontrado"
+	@test -f $(OVMF_VARS) || (echo "ERROR: $(OVMF_VARS) no encontrado" && exit 1)
+	@test -f $(OVMF_CODE) || (echo "ERROR: $(OVMF_CODE) no encontrado" && exit 1)
 	qemu-system-x86_64 \
-		-drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE.fd \
-		-drive if=pflash,format=raw,file=OVMF_VARS.fd \
+		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+		-drive if=pflash,format=raw,file=$(OVMF_VARS) \
 		-drive format=raw,file=aurora.img \
 		-serial stdio \
 		-m 512M \
