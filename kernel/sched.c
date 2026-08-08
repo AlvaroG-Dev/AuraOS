@@ -18,7 +18,7 @@ static uint32_t tick_counter = 0;
 void task_entry_wrapper(void (*fn)(void)) {
   fn();
   current_task->state = TASK_DEAD;
-  sched_yield(); // Ceder inmediatamente la CPU
+  sched_yield();
   while (1) { __asm__ volatile("hlt"); }
 }
 
@@ -32,10 +32,7 @@ void sched_init(void) {
   idle->next = idle;
   idle->rsp = 0;
 
-  // Calcular dirección alineada a 16 bytes dentro del buffer fpu_raw
   idle->fpu_state = ((uint64_t)idle->fpu_raw + 15) & ~0xFULL;
-  
-  // Guardar estado FPU/SSE limpio por defecto
   __asm__ volatile("fninit; fxsave64 (%0)" : : "r"(idle->fpu_state) : "memory");
 
   current_task = idle;
@@ -54,43 +51,41 @@ task_t *sched_create_task(void (*fn)(void)) {
   }
 
   /*
-   * Build the synthetic context consumed by task_switch:
-   * pop r15, r14, r13, r12, rbp, rbx, ret.
+   * task_switch restores the synthetic context in this exact order:
+   *   pop r15, pop r14, pop r13, pop r12, pop rbp, pop rbx, ret
    *
-   * stack is a byte pointer, so TASK_STACK_SIZE is measured in bytes.
-   * The initial stack also has to obey the x86-64 SysV ABI. task_trampoline
-   * makes a normal CALL to task_entry_wrapper; therefore task_trampoline
-   * must start with RSP % 16 == 0 so that the CALL makes the C function
-   * enter with RSP % 16 == 8, as required by the ABI.
+   * The initial stack must therefore be built in the reverse order. The
+   * previous implementation wrote the return address first and the saved
+   * registers afterwards, so the first pop loaded task_trampoline into r15
+   * and eventually ret loaded a zero/invalid address. That can manifest as
+   * a #GP/#UD immediately after the first context switch.
    *
-   * task_switch consumes 56 bytes (6 registers + return address). Choosing
-   * the synthetic context at an address congruent to 8 mod 16 gives exactly
-   * that alignment at task_trampoline entry.
+   * Align the top of the allocated byte buffer to 16 bytes. With seven
+   * 8-byte entries (56 bytes), task_trampoline is entered with RSP % 16 == 8.
+   * Its CALL then enters task_entry_wrapper with RSP % 16 == 0 before the
+   * return address is pushed, satisfying the System V x86-64 ABI requirement
+   * that the callee observes RSP % 16 == 8.
    */
   uint64_t stack_top = (uint64_t)(stack + TASK_STACK_SIZE);
-  stack_top = (stack_top & ~0xFULL) - 8ULL;
+  stack_top &= ~0xFULL;
   uint64_t *sp = (uint64_t *)stack_top;
 
-  *(--sp) = (uint64_t)task_trampoline;
-  *(--sp) = (uint64_t)0;               // rbx
-  *(--sp) = (uint64_t)0;               // rbp
-  *(--sp) = (uint64_t)fn;              // r12
-  *(--sp) = (uint64_t)0;               // r13
-  *(--sp) = (uint64_t)0;               // r14
   *(--sp) = (uint64_t)0;               // r15
+  *(--sp) = (uint64_t)0;               // r14
+  *(--sp) = (uint64_t)0;               // r13
+  *(--sp) = (uint64_t)fn;              // r12
+  *(--sp) = (uint64_t)0;               // rbp
+  *(--sp) = (uint64_t)0;               // rbx
+  *(--sp) = (uint64_t)task_trampoline; // return address
 
   task->rsp = (uint64_t)sp;
   task->stack = (uint64_t *)stack;
   task->id = next_id++;
   task->state = TASK_READY;
 
-  // Calcular dirección alineada a 16 bytes
   task->fpu_state = ((uint64_t)task->fpu_raw + 15) & ~0xFULL;
-
-  // Inicializar estado FPU/SSE para la nueva tarea
   __asm__ volatile("fninit; fxsave64 (%0)" : : "r"(task->fpu_state) : "memory");
 
-  // Insertar en lista circular
   task_t *tail = task_list_head;
   while (tail->next != task_list_head)
     tail = tail->next;
@@ -100,18 +95,16 @@ task_t *sched_create_task(void (*fn)(void)) {
   return task;
 }
 
-// Recolector de basura: Desvincula y libera tareas muertas
 static void reap_dead_tasks(void) {
   if (!current_task) return;
 
   task_t *curr = current_task;
-  // Recorrer la lista circular buscando tareas TASK_DEAD
   for (int i = 0; i < 32; i++) {
     task_t *next = curr->next;
     if (next == current_task) break;
 
     if (next->state == TASK_DEAD) {
-      curr->next = next->next; // Desvincular de la lista
+      curr->next = next->next;
       if (next == task_list_head) task_list_head = curr->next;
 
       serial_puts("[SCHED] Limpiando tarea zombie ID=");
@@ -132,7 +125,7 @@ void sched_tick(void) {
   if (tick_counter < SCHED_INTERVAL) return;
   tick_counter = 0;
 
-  reap_dead_tasks(); // Limpiar memoria de tareas finalizadas
+  reap_dead_tasks();
 
   task_t *next = current_task->next;
   int max = 64;
