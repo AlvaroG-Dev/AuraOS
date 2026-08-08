@@ -1,8 +1,6 @@
 # Makefile global - AuraOS
 
-# Firmware OVMF is always resolved from the project root. Using CURDIR avoids
-# depending on the runner's /usr/share layout and also makes `make run` behave
-# identically locally and in CI.
+# Firmware OVMF is resolved from the project root.
 OVMF_CODE = $(CURDIR)/OVMF_CODE.fd
 OVMF_VARS = $(CURDIR)/OVMF_VARS.fd
 
@@ -11,17 +9,14 @@ OVMF_VARS = $(CURDIR)/OVMF_VARS.fd
 all: image
 
 sysroot:
-	@# 1. Crear la estructura base en sysroot
 	@mkdir -p sysroot/system/icons sysroot/system/wallpapers
 	@if [ ! -f sysroot/system/config.txt ]; then \
 		echo "AuraOS v0.1.0 Initramfs Config" > sysroot/system/config.txt; \
 	fi
-	@# 2. Copiar assets persistentes (icons, wallpapers, etc.) a sysroot si existe la carpeta
 	@if [ -d assets ]; then \
 		echo "[Makefile] Copiando assets a sysroot..."; \
 		cp -r assets/* sysroot/ 2>/dev/null || true; \
 	fi
-	@# 3. Empaquetar carpetas e iconos en initrd.tar
 	tar --format=ustar -cf kernel/initrd.tar -C sysroot .
 
 bootloader:
@@ -51,6 +46,7 @@ run: image
 		-serial stdio \
 		-m 512M \
 		-cpu qemu64 \
+		-display none \
 		-no-reboot -no-shutdown
 
 clean:
