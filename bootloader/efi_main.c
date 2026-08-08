@@ -8,7 +8,6 @@
 #define KERNEL_PATH L"\\kernel.elf"
 #define ET_EXEC 2
 
-// Definiciones ELF64
 typedef uint64_t Elf64_Addr;
 typedef uint64_t Elf64_Off;
 typedef uint16_t Elf64_Half;
@@ -52,7 +51,6 @@ struct Elf64_Phdr {
     Elf64_Xword p_align;
 };
 
-// Info pasada al kernel
 struct kernel_boot_info {
     uint64_t fb_base;
     uint64_t fb_size;
@@ -142,7 +140,7 @@ static EFI_STATUS load_kernel(EFI_FILE *root, VOID **entry_point, UINT64 *pml4) 
     status = uefi_call_wrapper(file->Read, 3, file, &size, &ehdr);
     if (EFI_ERROR(status) || size != sizeof(ehdr)) goto cleanup;
 
-    if (ehdr.e_ident[0] != ELFMAG0 || ehdr.e_ident[1] != ELFMAG1 || 
+    if (ehdr.e_ident[0] != ELFMAG0 || ehdr.e_ident[1] != ELFMAG1 ||
         ehdr.e_ident[2] != ELFMAG2 || ehdr.e_ident[3] != ELFMAG3) {
         Print(L"[BOOT] No es un ELF valido\n");
         status = EFI_INVALID_PARAMETER;
@@ -159,6 +157,8 @@ static EFI_STATUS load_kernel(EFI_FILE *root, VOID **entry_point, UINT64 *pml4) 
         goto cleanup;
     }
 
+    EFI_PHYSICAL_ADDRESS entry_phys = 0;
+
     for (UINTN i = 0; i < ehdr.e_phnum; i++) {
         struct Elf64_Phdr phdr;
         UINTN phdr_size = sizeof(phdr);
@@ -171,7 +171,6 @@ static EFI_STATUS load_kernel(EFI_FILE *root, VOID **entry_point, UINT64 *pml4) 
 
         EFI_PHYSICAL_ADDRESS paddr = phdr.p_paddr;
         if (paddr == 0) {
-            // Si p_paddr es 0, asignar donde sea
             status = uefi_call_wrapper(BS->AllocatePages, 4, AllocateAnyPages, EfiLoaderData,
                                         (phdr.p_memsz + 0xFFF) / 0x1000, &paddr);
         } else {
@@ -204,12 +203,28 @@ static EFI_STATUS load_kernel(EFI_FILE *root, VOID **entry_point, UINT64 *pml4) 
             map_page_4k(pml4, phdr.p_vaddr + p * 0x1000, paddr + p * 0x1000);
         }
 
+        if (ehdr.e_entry >= phdr.p_vaddr && ehdr.e_entry < phdr.p_vaddr + phdr.p_filesz) {
+            entry_phys = paddr + (ehdr.e_entry - phdr.p_vaddr);
+        }
+
         Print(L"[BOOT] Segmento %d: vaddr=0x%lx paddr=0x%lx pages=%d\n",
               i, phdr.p_vaddr, paddr, num_pages);
     }
 
     *entry_point = (VOID*)ehdr.e_entry;
     Print(L"[BOOT] Entry point: 0x%lx\n", ehdr.e_entry);
+
+    if (entry_phys != 0) {
+        UINT8 *bytes = (UINT8*)entry_phys;
+        Print(L"[BOOT] Entry physical: 0x%lx bytes:", entry_phys);
+        for (UINTN i = 0; i < 32; i++) {
+            Print(L" %02x", bytes[i]);
+        }
+        Print(L"\n");
+    } else {
+        Print(L"[BOOT] ERROR: Entry point no pertenece a ningun PT_LOAD\n");
+    }
+
     status = EFI_SUCCESS;
 
 cleanup:
@@ -238,15 +253,12 @@ static EFI_STATUS build_page_tables(EFI_PHYSICAL_ADDRESS *pml4_out) {
     EFI_PHYSICAL_ADDRESS pml4_addr = 0, pdpt_addr = 0;
     EFI_PHYSICAL_ADDRESS pd_addrs[4] = {0};
 
-    // Asignar PML4
     status = uefi_call_wrapper(BS->AllocatePages, 4, AllocateAnyPages, EfiLoaderData, 1, &pml4_addr);
     if (EFI_ERROR(status)) return status;
 
-    // Asignar PDPT (Identity)
     status = uefi_call_wrapper(BS->AllocatePages, 4, AllocateAnyPages, EfiLoaderData, 1, &pdpt_addr);
     if (EFI_ERROR(status)) return status;
 
-    // Asignar 4 tablas PD (cada una mapea 1GB usando paginas de 2MB)
     for (int i = 0; i < 4; i++) {
         status = uefi_call_wrapper(BS->AllocatePages, 4, AllocateAnyPages, EfiLoaderData, 1, &pd_addrs[i]);
         if (EFI_ERROR(status)) return status;
@@ -259,15 +271,13 @@ static EFI_STATUS build_page_tables(EFI_PHYSICAL_ADDRESS *pml4_out) {
     ZeroMem(pdpt, 4096);
     for (int i = 0; i < 4; i++) ZeroMem((VOID*)pd_addrs[i], 4096);
 
-    // Identity-map primeros 4GB (4 tablas PD x 512 paginas x 2MB = 4GB)
-    // Usamos huge pages (bit 7 = 1)
     pml4[0] = pdpt_addr | 0x03;
     for (int pd_idx = 0; pd_idx < 4; pd_idx++) {
         pdpt[pd_idx] = pd_addrs[pd_idx] | 0x03;
         UINT64 *pd = (UINT64*)pd_addrs[pd_idx];
         for (int pt_idx = 0; pt_idx < 512; pt_idx++) {
             uint64_t phys = (uint64_t)pd_idx * 0x40000000 + pt_idx * 0x200000;
-            pd[pt_idx] = phys | 0x83; // PTE_PRESENT | PTE_WRITABLE | PTE_HUGE
+            pd[pt_idx] = phys | 0x83;
         }
     }
 
@@ -278,7 +288,6 @@ static EFI_STATUS build_page_tables(EFI_PHYSICAL_ADDRESS *pml4_out) {
 static void jump_to_kernel(VOID *kernel_entry, EFI_HANDLE image_handle, struct kernel_boot_info *kinfo, EFI_PHYSICAL_ADDRESS pml4_addr) {
     EFI_STATUS status;
 
-    // Copiar memmap a buffer seguro (dentro del identity-map)
     EFI_PHYSICAL_ADDRESS safe_memmap_addr = 0;
     status = uefi_call_wrapper(BS->AllocatePages, 4, AllocateAnyPages, EfiLoaderData,
                                 (mem_map.map_size + 0xFFF) / 0x1000, &safe_memmap_addr);
@@ -292,23 +301,19 @@ static void jump_to_kernel(VOID *kernel_entry, EFI_HANDLE image_handle, struct k
     Print(L"[BOOT] Tablas de pagina listas. Memmap copiado.\n");
     Print(L"[BOOT] Saltando al kernel...\n");
 
-    // Deshabilitar interrupciones antes de ExitBootServices
     __asm__ volatile ("cli");
 
     status = uefi_call_wrapper(BS->ExitBootServices, 2, image_handle, mem_map.map_key);
     if (EFI_ERROR(status)) {
-        // Reintentar con mapa actualizado
         get_memory_map(image_handle);
         CopyMem((VOID*)safe_memmap_addr, mem_map.map, mem_map.map_size);
         kinfo->memmap = safe_memmap_addr;
         status = uefi_call_wrapper(BS->ExitBootServices, 2, image_handle, mem_map.map_key);
         if (EFI_ERROR(status)) {
-            // No podemos usar Print despues de esto, pero ya fallamos
             while (1) __asm__ volatile ("hlt");
         }
     }
 
-    // Ahora cambiamos CR3 (despues de ExitBootServices)
     __asm__ volatile ("movq %0, %%cr3" : : "r"(pml4_addr) : "memory");
 
     typedef void (*kernel_fn_t)(struct kernel_boot_info*);
@@ -324,7 +329,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *system_tab
     Print(L"\n=== AURORA OS BOOTLOADER ===\n");
     Print(L"[BOOT] Cargando kernel...\n");
 
-    EFI_STATUS status = uefi_call_wrapper(BS->OpenProtocol, 6, image_handle, &LoadedImageProtocol, 
+    EFI_STATUS status = uefi_call_wrapper(BS->OpenProtocol, 6, image_handle, &LoadedImageProtocol,
                                            (VOID**)&loaded_image, image_handle, NULL, EFI_OPEN_PROTOCOL_GET_PROTOCOL);
     EFI_FILE *root = NULL;
     if (EFI_ERROR(status)) {
@@ -368,7 +373,6 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *system_tab
         return status;
     }
 
-    // Preparar info para el kernel
     struct kernel_boot_info kinfo = {0};
     if (gop) {
         kinfo.fb_base   = gop->Mode->FrameBufferBase;
@@ -383,7 +387,6 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *system_tab
     kinfo.memmap_desc_ver  = mem_map.desc_version;
 
     jump_to_kernel(kernel_entry, image_handle, &kinfo, pml4_addr);
-    
-    // Nunca deberia llegar aqui
+
     while (1) __asm__ volatile ("hlt");
 }
