@@ -15,6 +15,7 @@
 #include "rtc.h"
 #include "tarfs.h"
 #include "initrd.h"
+#include "selftest.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -144,7 +145,6 @@ static void parse_memmap(void) {
   serial_puts(" MB\n");
 }
 
-// PIT: Programmable Interval Timer
 #define PIT_FREQ 1193182
 #define PIT_HZ 1000
 
@@ -158,40 +158,32 @@ static void pit_init(void) {
   serial_puts(" Hz\n");
 }
 
-// ---------------------------------------------------------------------------
-// Tareas de demostracion del scheduler
-// ---------------------------------------------------------------------------
 static void task_demo_a(void);
 static void task_demo_b(void);
 
 static void task_demo_a(void) {
   uint64_t count = 0;
   while (1) {
-    if (count % 5000000 == 0) {
-      serial_puts("[TASK-A] vivo\n");
-    }
+    if (count % 5000000 == 0) serial_puts("[TASK-A] vivo\n");
     count++;
-    sched_yield(); // Cede el turno inmediatamente en vez de dormir la CPU con hlt
+    sched_yield();
   }
 }
 
 static void task_demo_b(void) {
   uint64_t count = 0;
   while (1) {
-    if (count % 5000000 == 0) {
-      serial_puts("[TASK-B] vivo\n");
-    }
+    if (count % 5000000 == 0) serial_puts("[TASK-B] vivo\n");
     count++;
-    sched_yield(); // Cede el turno inmediatamente
+    sched_yield();
   }
 }
 
-// Inicializar SSE (CR4.OSFXSR)
 static void sse_init(void) {
   uint64_t cr4;
   __asm__ volatile("movq %%cr4, %0" : "=r"(cr4));
-  cr4 |= 0x200; // OSFXSR
-  cr4 |= 0x400; // OSXMMEXCPT
+  cr4 |= 0x200;
+  cr4 |= 0x400;
   __asm__ volatile("movq %0, %%cr4" : : "r"(cr4));
   serial_puts("[SSE] OSFXSR + OSXMMEXCPT habilitados\n");
 }
@@ -199,29 +191,20 @@ static void sse_init(void) {
 volatile uint64_t tick_count = 0;
 static void timer_handler(void) {
   tick_count++;
-  if (tick_count % PIT_HZ == 0) {
-    compositor_notify_clock_tick();
-  }
-  sched_tick(); // Preemptive scheduler
+  if (tick_count % PIT_HZ == 0) compositor_notify_clock_tick();
+  sched_tick();
 }
 
-// PS/2 keyboard and mouse handled in kernel/ps2.c (ps2_init)
-
 void kmain(struct kernel_boot_info *kinfo) {
-  // Inicializar serial PRIMERO (antes de cualquier operacion que pueda fallar)
   serial_init();
   serial_puts("\n========================================\n");
   serial_puts("   AURORA OS KERNEL x86_64\n");
   serial_puts("   Fase 1 - Kernel Base (REV 4)\n");
   serial_puts("========================================\n\n");
 
-  // Inicializar SSE ANTES de cualquier operacion que pueda usar SSE
-  // (como __builtin_memcpy)
   serial_puts("[INIT] SSE... ");
   sse_init();
   serial_puts("OK\n");
-
-  // Ahora es seguro usar __builtin_memcpy (puede usar movaps)
   __builtin_memcpy(&boot, kinfo, sizeof(boot));
 
   serial_puts("[BOOT] Framebuffer: 0x");
@@ -234,14 +217,8 @@ void kmain(struct kernel_boot_info *kinfo) {
   serial_putn(boot.fb_pitch, 10, 0);
   serial_puts("\n");
 
-  serial_puts("[INIT] GDT... ");
-  gdt_init();
-  serial_puts("OK\n");
-
-  serial_puts("[INIT] IDT... ");
-  idt_init();
-  serial_puts("OK\n");
-
+  serial_puts("[INIT] GDT... "); gdt_init(); serial_puts("OK\n");
+  serial_puts("[INIT] IDT... "); idt_init(); serial_puts("OK\n");
   serial_puts("[INIT] Paging... ");
   uint64_t cr3;
   __asm__ volatile("movq %%cr3, %0" : "=r"(cr3));
@@ -249,88 +226,56 @@ void kmain(struct kernel_boot_info *kinfo) {
   serial_puts("OK\n");
 
   parse_memmap();
-
   serial_puts("[INIT] Iniciando PMM...\n");
-  pmm_init(boot.memmap, boot.memmap_size, boot.memmap_desc_size);
+  if (pmm_init(boot.memmap, boot.memmap_size, boot.memmap_desc_size) != 0) {
+    serial_puts("[SELFTEST] FALLO CRITICO: PMM no pudo inicializarse\n");
+    return;
+  }
 
   serial_puts("[INIT] Iniciando Heap (kmalloc)...\n");
   heap_init();
 
-  // Tests del heap
-  uint8_t *buf = (uint8_t *)kmalloc(64);
-  if (buf) {
-    for (int i = 0; i < 64; i++)
-      buf[i] = (uint8_t)i;
-    int ok = 1;
-    for (int i = 0; i < 64; i++)
-      if (buf[i] != (uint8_t)i) {
-        ok = 0;
-        break;
-      }
-    serial_puts(ok ? "[HEAP-TEST] kmalloc 64B: OK\n"
-                   : "[HEAP-TEST] kmalloc 64B: FALLO\n");
-    kfree(buf);
+  if (!selftest_memory()) {
+    serial_puts("[SELFTEST] FALLO CRITICO: abortando arranque\n");
+    return;
   }
-  uint8_t *big = (uint8_t *)kmalloc(8192);
-  serial_puts(big ? "[HEAP-TEST] kmalloc 8KB: OK\n"
-                  : "[HEAP-TEST] kmalloc 8KB: FALLO\n");
-  if (big)
-    kfree(big);
+
   pit_init();
   serial_puts("[INIT] Inicializando Initramfs (TarFS)...\n");
   size_t initrd_size = (size_t)(initrd_end - initrd_start);
   tarfs_init(initrd_start, initrd_size);
-  // Listar todo el Initramfs por consola serie
   tarfs_list("");
-  // Prueba de apertura de archivo de prueba
   tar_node_t *cfg = tarfs_open("system/config.txt");
   if (cfg) {
-      serial_puts("[TARFS] Contenido de system/config.txt:\n    '");
-      for (size_t i = 0; i < cfg->size; i++) {
-          serial_putc(cfg->data[i]);
-      }
-      serial_puts("'\n");
+    serial_puts("[TARFS] Contenido de system/config.txt:\n    '");
+    for (size_t i = 0; i < cfg->size; i++) serial_putc(cfg->data[i]);
+    serial_puts("'\n");
   }
-  // Inicializar RTC CMOS
-  serial_puts("[INIT] RTC CMOS... ");
-  rtc_init();
-  serial_puts("OK\n");
-  // Iniciar scheduler ANTES de los drivers, despues del heap
+
+  serial_puts("[INIT] RTC CMOS... "); rtc_init(); serial_puts("OK\n");
   serial_puts("[INIT] Iniciando Scheduler...\n");
   sched_init();
-
   irq_install_handler(0, timer_handler);
-  // Initialize PS/2 keyboard + mouse (registers IRQ handlers)
   ps2_init();
 
-// Inicializar framebuffer solo si hay uno valido
   int fb_ok = 0;
   if (boot.fb_base != 0 && boot.fb_width > 0 && boot.fb_height > 0) {
     serial_puts("[FB] Mapeando framebuffer en modo Write-Combining (WC)... ");
-    
     uint64_t fb_aligned = boot.fb_base & ~0xFFFULL;
     uint64_t fb_end = (boot.fb_base + boot.fb_size + 0xFFF) & ~0xFFFULL;
     uint64_t fb_size_aligned = fb_end - fb_aligned;
-
-    // Remapeamos SIEMPRE con PTE_WRITECOMB (sin importar si fb_base < 4GB o > 4GB)
     if (paging_map_range(fb_aligned, fb_aligned, fb_size_aligned,
                          PTE_WRITABLE | PTE_WRITECOMB) == 0) {
       serial_puts("OK\n");
       fb_ok = 1;
+      fb_init(boot.fb_base, boot.fb_width, boot.fb_height, boot.fb_pitch);
     } else {
       serial_puts("FALLIDO (pool agotado)\n");
     }
-
-    if (fb_ok) {
-      fb_init(boot.fb_base, boot.fb_width, boot.fb_height, boot.fb_pitch);
-    }
   }
 
-  if (!fb_ok) {
-    serial_puts("[FB] No hay framebuffer disponible o fallo al mapear\n");
-  }
+  if (!fb_ok) serial_puts("[FB] No hay framebuffer disponible o fallo al mapear\n");
 
-  // Dibujar UI solo si el framebuffer esta disponible
   if (fb_ptr && fb_ok) {
     fb_fillrect(0, 0, fb_width, fb_height, 0x0F0F23);
     fb_fillrect(0, 0, fb_width, 40, 0x1A1A2E);
@@ -350,7 +295,6 @@ void kmain(struct kernel_boot_info *kinfo) {
     fb_puts(win_x + 10, win_y + 105, "Timer: Running | Keyboard: Active",
             0xAAAAAA, 0x1E1E2E);
 
-    // PMM Test (ya fue corrido arriba, solo mostramos el resultado)
     uint64_t test_page = pmm_alloc_page();
     if (test_page) {
       serial_puts("[PMM-TEST] Pagina reservada en 0x");
@@ -366,59 +310,27 @@ void kmain(struct kernel_boot_info *kinfo) {
   serial_puts("[INIT] Aurora OS listo. Multitarea activa.\n");
   if (fb_ok) {
     compositor_init();
-
-// 3. Crear Ventana 1: Aurora Terminal
-  window_t *win_term = compositor_create_window(
-      100, 80, 520, 340, "Aurora Terminal - x86_64", WIN_FLAGS_INACTIVE);
-
-  if (win_term) {
-    win_set_icon_text(win_term, ">", WIN11_ACCENT);
-    win_clear(win_term, 0xFF1E1E1E); // Fondo oscuro de terminal
-    
-    // Dibujar prompt de comando de ejemplo
-    win_draw_string(win_term, 16, 16, "aurora-os:~$ ", WIN11_ACCENT, FONT_ID_MONO);
-    win_update(win_term);
-  }
-
-  // 4. Crear Ventana 2: System Performance (Activa / Enfocada)
-  window_t *win_perf = compositor_create_window(
-      300, 180, 420, 260, "System Performance", WIN_FLAGS_FOCUSED);
-
-  if (win_perf) {
-    win_set_icon_text(win_perf, ">", WIN11_ACCENT);
-    win_clear(win_perf, WIN11_SURFACE_CARD);
-    
-    // Contenido de rendimiento
-    win_draw_string(win_perf, 20, 20, "CPU Usage: 3%", WIN11_TEXT_PRIMARY, FONT_ID_MONO);
-    win_draw_string(win_perf, 20, 40, "RAM Usage: 42MB / 512MB", WIN11_TEXT_SECONDARY, FONT_ID_MONO);
-    win_update(win_perf);
-  }
-
-  serial_puts("[KERNEL] Ventanas creadas. Cediendo control al compositor...\n");
-    sched_create_task(compositor_thread);
-  }
-  // Crear dos tareas de demostracion
-  // (definidas mas abajo, necesitan ser antes de sti)
-  sched_create_task(task_demo_a);
-  sched_create_task(task_demo_b);
-
-  __asm__ volatile("sti");
-
-  // Loop principal (tarea idle)
-  uint64_t last_tick = 0;
-  while (1) {
-    if (tick_count != last_tick) {
-      last_tick = tick_count;
-      if (tick_count % (PIT_HZ / 2) == 0) {
-        static int on = 0;
-        on = !on;
-        uint32_t color = on ? 0x00FF88 : 0x1E1E2E;
-        if (fb_ptr && fb_ok)
-          fb_fillrect(130, 225, 8, 16, color);
-      }
+    window_t *win_term = compositor_create_window(
+        100, 80, 520, 340, "Aurora Terminal - x86_64", WIN_FLAGS_INACTIVE);
+    if (win_term) {
+      win_set_icon_text(win_term, ">", WIN11_ACCENT);
+      win_clear(win_term, 0xFF1E1E1E);
+      win_draw_string(win_term, 16, 16, "aurora-os:~$ ", WIN11_ACCENT, FONT_ID_MONO);
+      win_update(win_term);
     }
-    // Process buffered PS/2 events in non-IRQ context
-    ps2_process();
-    __asm__ volatile("hlt");
+    window_t *win_info = compositor_create_window(
+        640, 80, 360, 220, "System Information", WIN_FLAGS_INACTIVE);
+    if (win_info) {
+      win_set_icon_text(win_info, "i", WIN11_ACCENT);
+      win_clear(win_info, 0xFF181818);
+      win_draw_string(win_info, 16, 16, "AURORA OS", WIN11_ACCENT, FONT_ID_SANS);
+      win_draw_string(win_info, 16, 42, "Kernel: x86_64", 0xFFFFFFFF, FONT_ID_SANS);
+      win_draw_string(win_info, 16, 64, "Memory: PMM + VMM", 0xFFFFFFFF, FONT_ID_SANS);
+      win_draw_string(win_info, 16, 86, "Scheduler: active", 0xFFFFFFFF, FONT_ID_SANS);
+      win_update(win_info);
+    }
+    compositor_start();
   }
+
+  while (1) __asm__ volatile("hlt");
 }
