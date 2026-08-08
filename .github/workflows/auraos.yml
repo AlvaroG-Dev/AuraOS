@@ -1,0 +1,43 @@
+name: AuraOS CI
+
+on:
+  push:
+    branches: [main, phase-a-foundation]
+  pull_request:
+
+jobs:
+  build-and-smoke-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain and emulator
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc make nasm gnu-efi mtools dosfstools qemu-system-x86 ovmf
+
+      - name: Build AuraOS
+        run: make clean && make
+
+      - name: Boot test in QEMU
+        shell: bash
+        run: |
+          set -o pipefail
+          set +e
+          timeout --signal=TERM 15s make run 2>&1 | tee qemu.log
+          status=${PIPESTATUS[0]}
+          set -e
+
+          # AuraOS is intentionally left running, so timeout(124) is expected.
+          if [ "$status" -ne 124 ]; then
+            echo "QEMU exited unexpectedly with status $status"
+            exit 1
+          fi
+
+          grep -q "[PMM] Bitmap" qemu.log
+          grep -q "[HEAP] Heap inicializado" qemu.log
+          grep -q "[INIT] Iniciando Scheduler" qemu.log
+          echo "AuraOS boot smoke test: OK"
