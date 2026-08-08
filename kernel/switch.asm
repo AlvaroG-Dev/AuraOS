@@ -18,23 +18,12 @@ task_switch:
     ; Guardar RSP actual antes de tocar el estado de la tarea.
     mov [rdi], rsp
 
-    ; FPU/SSE: ambos buffers se crean alineados a 16 bytes.
-    ; FX* requiere una dirección alineada a 16 bytes.
-    mov rax, [rdi + 24]
-    test rax, rax
-    jz .save_fpu_done
-    test rax, 0xF
-    jnz .save_fpu_done
-    fxsave64 [rax]
-.save_fpu_done:
-
-    mov rax, [rsi + 24]
-    test rax, rax
-    jz .restore_fpu_done
-    test rax, 0xF
-    jnz .restore_fpu_done
-    fxrstor64 [rax]
-.restore_fpu_done:
+    ; task_t.fpu_raw comienza en offset 0x20 y el task_t devuelto por
+    ; kmalloc() está alineado a 16 bytes. Por tanto el buffer también lo está.
+    ; Usar el buffer embebido elimina una segunda capa de punteros que podría
+    ; quedar corrupta y provocar #GP en FXSAVE/FXRSTOR.
+    fxsave64 [rdi + 0x20]
+    fxrstor64 [rsi + 0x20]
 
     ; Restaurar contexto de la nueva tarea.
     mov rsp, [rsi]
